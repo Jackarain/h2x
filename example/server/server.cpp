@@ -131,14 +131,12 @@ net::awaitable<void> server_session(ssl_stream ssl_sock)
     s->initial_window_size = 65535;
     s->max_frame_size = 16384;
 
-    // 执行 HTTP/2 握手，握手完成后泵送协程在后台自动运行。
-    {
-        boost::system::error_code hs_ec;
-        co_await conn->async_handshake(role::server, *s, hs_ec);
-        if (hs_ec) {
-            std::cerr << "Session handshake error: " << hs_ec.message() << std::endl;
-            co_return;
-        }
+    // 执行 HTTP/2 握手，握手完成后 pump 协程在后台自动运行。
+    boost::system::error_code hs_ec;
+    co_await conn->async_handshake(role::server, *s, hs_ec);
+    if (hs_ec) {
+        std::cerr << "Session handshake error: " << hs_ec.message() << std::endl;
+        co_return;
     }
 
     // 循环接受新请求（新 Stream）。
@@ -157,7 +155,7 @@ net::awaitable<void> server_session(ssl_stream ssl_sock)
             net::detached);
     }
 
-    // 清理：关闭连接并等待泵送协程退出.
+    // 清理：关闭连接并等待 pump 协程退出.
     conn->close();
     if (!co_await conn->async_wait_pump(3s)) {
         std::cerr << "Warning: pump did not exit within timeout" << std::endl;

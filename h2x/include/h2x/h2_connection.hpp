@@ -191,7 +191,7 @@ namespace h2x {
          * 该函数负责发送/接收连接前言与 SETTINGS，协商设置。
          * 握手完成后，内部的输入/输出 pump（`pump_in` 与 `pump_out`）
          * 会在后台独立运行，`async_handshake` 将正常返回。
-         * 泵送协程在调用 `close()` 设置 `abort_` 标志后自动退出。
+         * pump 协程在调用 `close()` 设置 `abort_` 标志后自动退出。
          *
          * @param r 本端角色（client 或 server）。
          * @param s 要发送/协商的本端 `settings`。
@@ -287,7 +287,7 @@ namespace h2x {
                 // 更新协商后的配置.
                 settings_ = s;
 
-                // 在后台启动输入/输出泵送协程，async_handshake 将正常返回.
+                // 在后台启动输入/输出 pump 协程，async_handshake 将正常返回.
                 auto exit_flag = pump_done_;
                 net::co_spawn(strand_,
                     [this, exit_flag]() -> net::awaitable<void> {
@@ -334,16 +334,16 @@ namespace h2x {
         }
 
         /**
-         * @brief 异步等待泵送协程完全退出。
+         * @brief 异步等待 pump 协程完全退出。
          *
-         * 内部泵送协程（pump_in() && pump_out()）退出时，此函数返回 true。
-         * 若在指定的 timeout 时间内泵送协程仍未退出，返回 false。
+         * 内部 pump 协程（pump_in() && pump_out()）退出时，此函数返回 true。
+         * 若在指定的 timeout 时间内 pump 协程仍未退出，返回 false。
          * 通常在调用 close() 后调用此函数，确保连接对象可安全销毁。
          *
          * @tparam Rep 时间精度的算术类型。
          * @tparam Period 时间单位的 std::ratio 类型。
          * @param timeout 最长等待时间。
-         * @return awaitable<bool> 超时返回 false，泵送协程正常退出返回 true。
+         * @return awaitable<bool> 超时返回 false，pump 协程正常退出返回 true。
          */
         template <typename Rep, typename Period>
         net::awaitable<bool> async_wait_pump(
@@ -881,7 +881,7 @@ namespace h2x {
             }
         }
 
-        // 用于发送数据的处理泵.
+        // 用于发送数据的处理 pump.
         net::awaitable<void> pump_out() noexcept
         {
             boost::system::error_code ec;
@@ -906,7 +906,7 @@ namespace h2x {
             co_return;
         }
 
-        // 用于接收数据的处理泵.
+        // 用于接收数据的处理 pump.
         net::awaitable<void> pump_in()
         {
             boost::system::error_code ec;
@@ -941,7 +941,7 @@ namespace h2x {
         // 输出队列, 用于存储待发送的数据.
         std::deque<std::vector<uint8_t>> out_queue_;
 
-        // 用于通知输出处理泵发送数据的定时器.
+        // 用于通知输出处理 pump 发送数据的定时器.
         net::steady_timer out_notifier_;
 
         // 用于保护并发访问的 strand.
@@ -976,7 +976,7 @@ namespace h2x {
         // 用于标记是否需要中止连接.
         std::atomic_bool abort_{false};
 
-        // 泵送协程退出标志（pump_in/pump_out 完成时设为 true）.
+        // pump 协程退出标志（pump_in/pump_out 完成时设为 true）.
         std::shared_ptr<std::atomic<bool>> pump_done_{
             std::make_shared<std::atomic<bool>>(false)};
 

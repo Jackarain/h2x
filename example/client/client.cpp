@@ -113,14 +113,12 @@ net::awaitable<void> do_request(const std::string& host, const std::string& port
     s->initial_window_size = 65535;
     s->max_frame_size = 16384;
 
-    // 执行 HTTP/2 握手，握手完成后泵送协程在后台自动运行.
-    {
-        boost::system::error_code hs_ec;
-        co_await conn->async_handshake(role::client, *s, hs_ec);
-        if (hs_ec) {
-            std::cerr << "Handshake error: " << hs_ec.message() << std::endl;
-            co_return;
-        }
+    // 执行 HTTP/2 握手，握手完成后 pump 协程在后台自动运行.
+    boost::system::error_code hs_ec;
+    co_await conn->async_handshake(role::client, *s, hs_ec);
+    if (hs_ec) {
+        std::cerr << "Handshake error: " << hs_ec.message() << std::endl;
+        co_return;
     }
 
     // 创建请求流.
