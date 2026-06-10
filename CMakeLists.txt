@@ -115,13 +115,6 @@ if (WIN32)
 		-D_UNICODE
 	)
 
-	add_definitions(
-		-DBOOST_ALL_STATIC_LINK
-		-DBOOST_THREAD_USE_LIB
-		-DBOOST_FILESYSTEM_STATIC_LINK
-		-DBOOST_USE_WINAPI_VERSION=0x0601
-	)
-
 endif()
 
 ################################################################################
