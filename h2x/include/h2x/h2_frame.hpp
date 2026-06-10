@@ -360,7 +360,8 @@ namespace h2x {
             return -1;
         }
 
-        if (ret + len > encoded.size()) {
+        // 先检查 len 不超出整个缓冲区，防止 ret + len 整数溢出。
+        if (len > encoded.size() || static_cast<size_t>(ret) + len > encoded.size()) {
             return -1;
         }
 
@@ -775,6 +776,9 @@ namespace h2x {
 
                 payload += nbytes;
                 payload_size -= nbytes;
+                if (static_cast<size_t>(nbytes) > header_block_len) {
+                    throw std::runtime_error("headers_frame: header block length underflow");
+                }
                 header_block_len -= nbytes;
             }
 
