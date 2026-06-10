@@ -53,6 +53,7 @@ option(ENABLE_BUILD_WERROR			"All warnings being treated as errors" OFF)
 option(ENABLE_USE_IO_URING			"Enable auto use io_uring" OFF)
 
 option(ENABLE_BUILD_TESTS			"Build unit tests with Boost.Test" OFF)
+option(ENABLE_BUILD_FUZZ			"Build fuzz targets (requires clang + libFuzzer)" OFF)
 option(ENABLE_BUILD_WITH_LIBCXX		"Build with libc++" OFF)
 
 option(ENABLE_MOLD					"Build using mold" OFF)
@@ -450,4 +451,10 @@ add_subdirectory(example)
 if(ENABLE_BUILD_TESTS)
 	enable_testing()
 	add_subdirectory(tests)
+endif()
+
+# 添加 fuzz 项目
+
+if(ENABLE_BUILD_FUZZ)
+	add_subdirectory(fuzz)
 endif()
