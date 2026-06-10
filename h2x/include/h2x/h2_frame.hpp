@@ -473,6 +473,12 @@ namespace h2x {
             if (size_ < 9) {
                 throw std::runtime_error("frame_codec: size must be at least 9");
             }
+            // 校验 payload_size 不超出实际缓冲区边界，防止后续所有派生帧解析器
+            // (data_frame / headers_frame / settings_frame 等) 发生越界读。
+            auto plen = payload_size();
+            if (plen > size_ - 9) {
+                throw std::runtime_error("frame_codec: payload size exceeds buffer");
+            }
         }
 
         static bool check_stream_id(uint32_t stream_id)
