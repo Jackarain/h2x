@@ -86,6 +86,45 @@ namespace h2x {
     特性之一（也是最容易误用导致浪费带宽的特性）。
 */
 
+
+    enum class http2_error_code : uint32_t {
+        NO_ERROR = 0x00,
+        PROTOCOL_ERROR = 0x01,
+        INTERNAL_ERROR = 0x02,
+        FLOW_CONTROL_ERROR = 0x03,
+        SETTINGS_TIMEOUT = 0x04,
+        STREAM_CLOSED = 0x05,
+        FRAME_SIZE_ERROR = 0x06,
+        REFUSED_STREAM = 0x07,
+        CANCEL = 0x08,
+        COMPRESSION_ERROR = 0x09,
+        CONNECT_ERROR = 0x0A,
+        ENHANCE_YOUR_CALM = 0x0B,
+        INADEQUATE_SECURITY = 0x0C,
+        HTTP_1_1_REQUIRED = 0x0D
+    };
+
+    inline std::string http2_error_code_to_string(http2_error_code code)
+    {
+        switch (code) {
+        case http2_error_code::NO_ERROR:  return "NO_ERROR";
+        case http2_error_code::PROTOCOL_ERROR: return "PROTOCOL_ERROR";
+        case http2_error_code::INTERNAL_ERROR: return "INTERNAL_ERROR";
+        case http2_error_code::FLOW_CONTROL_ERROR: return "FLOW_CONTROL_ERROR";
+        case http2_error_code::SETTINGS_TIMEOUT: return "SETTINGS_TIMEOUT";
+        case http2_error_code::STREAM_CLOSED: return "STREAM_CLOSED";
+        case http2_error_code::FRAME_SIZE_ERROR: return "FRAME_SIZE_ERROR";
+        case http2_error_code::REFUSED_STREAM:  return "REFUSED_STREAM";
+        case http2_error_code::CANCEL: return "CANCEL";
+        case http2_error_code::COMPRESSION_ERROR: return "COMPRESSION_ERROR";
+        case http2_error_code::CONNECT_ERROR: return "CONNECT_ERROR";
+        case http2_error_code::ENHANCE_YOUR_CALM:  return "ENHANCE_YOUR_CALM";
+        case http2_error_code::INADEQUATE_SECURITY: return "INADEQUATE_SECURITY";
+        case http2_error_code::HTTP_1_1_REQUIRED: return "HTTP_1_1_REQUIRED";
+        default: return "UNKNOWN";
+        }
+    }
+
     /**
      * @brief 估算对输入进行 HPACK Huffman 编码后所需的字节数。
      *
@@ -279,7 +318,7 @@ namespace h2x {
         std::vector<uint8_t> result;
 
         // 计算 huffman 编码后的大小.
-        auto size = huffman_encode_size(input);
+        auto size = static_cast<size_t>(huffman_encode_size(input));
         if (size >= input.size()) {
             size = input.size();
         }
@@ -331,7 +370,7 @@ namespace h2x {
             result.insert(result.end(), encoded.begin() + ret, encoded.begin() + ret + len);
         }
 
-        return ret + len;
+        return static_cast<int>(ret + len);
     }
 
     // 注意，hpack 动态索引表，索引从 62 开始，静态索引表索引从 1 开始.
@@ -353,7 +392,7 @@ namespace h2x {
             return &global_static_header_table[index - 1];
         }
 
-        if (index <= global_hpack_index_table_size + 61) {
+        if (index <= static_cast<uint32_t>(global_hpack_index_table_size + 61)) {
             auto& entry = global_hpack_index_table[index - 61 - 1];
             if (entry.has_value()) {
                 return &entry.value();
@@ -626,7 +665,7 @@ namespace h2x {
 
             // 计算 payload 大小.
             size_t payload_size = entries_.size() * settings_entry::settings_entry_size;
-            this->payload_size(payload_size);
+            this->payload_size(static_cast<uint32_t>(payload_size));
 
             // 填充 payload.
             uint8_t* payload = this->payload();
@@ -640,7 +679,7 @@ namespace h2x {
                 payload[i * settings_entry::settings_entry_size + 5] = entries_[i].value_ & 0xFF;
             }
 
-            return 9 + payload_size;
+            return static_cast<int>(9 + payload_size);
         }
 
         bool ack_ = false;
@@ -841,19 +880,19 @@ namespace h2x {
             payload[0] = entry.type_->pattern_;
 
             if (entry.index_ != 0) {
-                auto ret = hpack_pack_integer(entry.index_, entry.type_->nbits_);
+                auto ret = hpack_pack_integer(static_cast<uint64_t>(entry.index_), entry.type_->nbits_);
                 if (ret.empty() || size < ret.size()) {
                     return -1;
                 }
 
                 ret[0] |= payload[0];
                 std::memcpy(payload, ret.data(), ret.size());
-                nbytes = ret.size();
+                nbytes = static_cast<int>(ret.size());
                 payload += nbytes;
                 size -= nbytes;
 
                 // 检查值是否需要更新
-                const header_entry* tmp = hpack_index_to_frame(entry.index_);
+                const header_entry* tmp = hpack_index_to_frame(static_cast<uint32_t>(entry.index_));
                 if (tmp && tmp->value_ == entry.value_) {
                     return nbytes;
                 }
@@ -875,7 +914,7 @@ namespace h2x {
                 std::memcpy(payload, ret.data(), ret.size());
                 payload += ret.size();
                 size -= ret.size();
-                nbytes += ret.size();
+                nbytes += static_cast<int>(ret.size());
             }
 
             // 填充 value
@@ -887,7 +926,7 @@ namespace h2x {
             }
 
             std::memcpy(payload, ret.data(), ret.size());
-            nbytes += ret.size();
+            nbytes += static_cast<int>(ret.size());
 
             return nbytes;
         }
@@ -944,12 +983,12 @@ namespace h2x {
                 throw std::runtime_error("headers_frame: invalid index");
             }
 
-            auto frame = hpack_index_to_frame(index);
+            auto frame = hpack_index_to_frame(static_cast<uint32_t>(index));
             if (!frame) {
                 throw std::runtime_error("headers_frame: index out of range");
             }
 
-            entry.index_ = index;
+            entry.index_ = static_cast<int64_t>(index);
             entry.name_ = frame->name_;
             entry.value_ = frame->value_;
             entry.hash_ = frame->hash_;
@@ -1001,12 +1040,12 @@ namespace h2x {
                     throw std::runtime_error("headers_frame: invalid integer");
                 }
 
-                auto frame = hpack_index_to_frame(index);
+                auto frame = hpack_index_to_frame(static_cast<uint32_t>(index));
                 if (!frame) {
                     throw std::runtime_error("headers_frame: index out of range");
                 }
 
-                entry.index_ = index;
+                entry.index_ = static_cast<int64_t>(index);
                 entry.name_ = frame->name_;
                 nbytes = ret;
                 payload += ret;
@@ -1486,44 +1525,6 @@ namespace h2x {
 
     ////////////////////////////////////////////////////////////////////////////////
 
-    enum class goaway_error_code : uint32_t {
-        NO_ERROR = 0x00,
-        PROTOCOL_ERROR = 0x01,
-        INTERNAL_ERROR = 0x02,
-        FLOW_CONTROL_ERROR = 0x03,
-        SETTINGS_TIMEOUT = 0x04,
-        STREAM_CLOSED = 0x05,
-        FRAME_SIZE_ERROR = 0x06,
-        REFUSED_STREAM = 0x07,
-        CANCEL = 0x08,
-        COMPRESSION_ERROR = 0x09,
-        CONNECT_ERROR = 0x0A,
-        ENHANCE_YOUR_CALM = 0x0B,
-        INADEQUATE_SECURITY = 0x0C,
-        HTTP_1_1_REQUIRED = 0x0D
-    };
-
-    inline std::string goaway_error_code_to_string(goaway_error_code code)
-    {
-        switch (code) {
-        case goaway_error_code::NO_ERROR:  return "NO_ERROR";
-        case goaway_error_code::PROTOCOL_ERROR: return "PROTOCOL_ERROR";
-        case goaway_error_code::INTERNAL_ERROR: return "INTERNAL_ERROR";
-        case goaway_error_code::FLOW_CONTROL_ERROR: return "FLOW_CONTROL_ERROR";
-        case goaway_error_code::SETTINGS_TIMEOUT: return "SETTINGS_TIMEOUT";
-        case goaway_error_code::STREAM_CLOSED: return "STREAM_CLOSED";
-        case goaway_error_code::FRAME_SIZE_ERROR: return "FRAME_SIZE_ERROR";
-        case goaway_error_code::REFUSED_STREAM:  return "REFUSED_STREAM";
-        case goaway_error_code::CANCEL: return "CANCEL";
-        case goaway_error_code::COMPRESSION_ERROR: return "COMPRESSION_ERROR";
-        case goaway_error_code::CONNECT_ERROR: return "CONNECT_ERROR";
-        case goaway_error_code::ENHANCE_YOUR_CALM:  return "ENHANCE_YOUR_CALM";
-        case goaway_error_code::INADEQUATE_SECURITY: return "INADEQUATE_SECURITY";
-        case goaway_error_code::HTTP_1_1_REQUIRED: return "HTTP_1_1_REQUIRED";
-        default: return "UNKNOWN";
-        }
-    }
-
     /**
      * @brief GOAWAY 帧封装，携带最后已处理的流 ID 与错误码。
      */
@@ -1594,8 +1595,8 @@ namespace h2x {
         uint32_t get_last_stream_id() const { return last_stream_id_; }
         void set_last_stream_id(uint32_t id) { last_stream_id_ = id & 0x7FFFFFFF; }
 
-        goaway_error_code get_error_code() const { return static_cast<goaway_error_code>(error_code_); }
-        void set_error_code(goaway_error_code code) { error_code_ = static_cast<uint32_t>(code); }
+        http2_error_code get_error_code() const { return static_cast<http2_error_code>(error_code_); }
+        void set_error_code(http2_error_code code) { error_code_ = static_cast<uint32_t>(code); }
 
         const std::vector<uint8_t>& get_debug_data() const { return debug_data_; }
         void set_debug_data(const std::vector<uint8_t>& data) { debug_data_ = data; }
@@ -1751,44 +1752,6 @@ namespace h2x {
 
     ////////////////////////////////////////////////////////////////////////////////
 
-    enum class rst_stream_error_code : uint32_t {
-        NO_ERROR = 0x00,
-        PROTOCOL_ERROR = 0x01,
-        INTERNAL_ERROR = 0x02,
-        FLOW_CONTROL_ERROR = 0x03,
-        SETTINGS_TIMEOUT = 0x04,
-        STREAM_CLOSED = 0x05,
-        FRAME_SIZE_ERROR = 0x06,
-        REFUSED_STREAM = 0x07,
-        CANCEL = 0x08,
-        COMPRESSION_ERROR = 0x09,
-        CONNECT_ERROR = 0x0A,
-        ENHANCE_YOUR_CALM = 0x0B,
-        INADEQUATE_SECURITY = 0x0C,
-        HTTP_1_1_REQUIRED = 0x0D
-    };
-
-    inline std::string rst_stream_error_code_to_string(rst_stream_error_code code)
-    {
-        switch (code) {
-        case rst_stream_error_code::NO_ERROR: return "NO_ERROR";
-        case rst_stream_error_code::PROTOCOL_ERROR: return "PROTOCOL_ERROR";
-        case rst_stream_error_code::INTERNAL_ERROR: return "INTERNAL_ERROR";
-        case rst_stream_error_code::FLOW_CONTROL_ERROR: return "FLOW_CONTROL_ERROR";
-        case rst_stream_error_code::SETTINGS_TIMEOUT:  return "SETTINGS_TIMEOUT";
-        case rst_stream_error_code::STREAM_CLOSED: return "STREAM_CLOSED";
-        case rst_stream_error_code::FRAME_SIZE_ERROR: return "FRAME_SIZE_ERROR";
-        case rst_stream_error_code::REFUSED_STREAM: return "REFUSED_STREAM";
-        case rst_stream_error_code::CANCEL: return "CANCEL";
-        case rst_stream_error_code::COMPRESSION_ERROR:  return "COMPRESSION_ERROR";
-        case rst_stream_error_code::CONNECT_ERROR: return "CONNECT_ERROR";
-        case rst_stream_error_code::ENHANCE_YOUR_CALM: return "ENHANCE_YOUR_CALM";
-        case rst_stream_error_code::INADEQUATE_SECURITY: return "INADEQUATE_SECURITY";
-        case rst_stream_error_code::HTTP_1_1_REQUIRED: return "HTTP_1_1_REQUIRED";
-        default: return "UNKNOWN";
-        }
-    }
-
     /**
      * @brief RST_STREAM 帧封装，用于中止特定流并携带错误码。
      */
@@ -1832,8 +1795,8 @@ namespace h2x {
             return 9 + 4;
         }
 
-        rst_stream_error_code get_error_code() const { return static_cast<rst_stream_error_code>(error_code_); }
-        void set_error_code(rst_stream_error_code code) { error_code_ = static_cast<uint32_t>(code); }
+        http2_error_code get_error_code() const { return static_cast<http2_error_code>(error_code_); }
+        void set_error_code(http2_error_code code) { error_code_ = static_cast<uint32_t>(code); }
 
     private:
         uint32_t error_code_ = 0;

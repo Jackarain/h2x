@@ -547,7 +547,7 @@ namespace h2x {
             auto it = streams_.find(sid);
             if (it == streams_.end()) {
                 // 流不存在，发送 RST_STREAM.
-                co_await send_rst_stream(sid, rst_stream_error_code::STREAM_CLOSED);
+                co_await send_rst_stream(sid, http2_error_code::STREAM_CLOSED);
                 co_return;
             }
 
@@ -562,7 +562,7 @@ namespace h2x {
             // 更新流控窗口.
             size_t data_len = df.get_data().size();
             if (data_len > sd.local_window) {
-                co_await send_rst_stream(sid, rst_stream_error_code::FLOW_CONTROL_ERROR);
+                co_await send_rst_stream(sid, http2_error_code::FLOW_CONTROL_ERROR);
                 co_return;
             }
             sd.local_window -= data_len;
@@ -620,7 +620,7 @@ namespace h2x {
                 if ((role_ == role::server && sid % 2 == 0) ||
                     (role_ == role::client && sid % 2 == 1 && sid != 0)) {
                     // 违反 HTTP/2 协议，发送 GOAWAY PROTOCOL_ERROR
-                    co_await send_goaway(sid, goaway_error_code::PROTOCOL_ERROR);
+                    co_await send_goaway(sid, http2_error_code::PROTOCOL_ERROR);
                     co_return;
                 }
 
@@ -801,7 +801,7 @@ namespace h2x {
 
         // ── 帧发送辅助 ──
 
-        net::awaitable<void> send_rst_stream(uint32_t sid, rst_stream_error_code code)
+        net::awaitable<void> send_rst_stream(uint32_t sid, http2_error_code code)
         {
             uint8_t buf[64] = {0};
             rst_stream_frame rf(buf, sizeof(buf), false);
@@ -831,7 +831,7 @@ namespace h2x {
             co_return;
         }
 
-        net::awaitable<void> send_goaway(uint32_t last_sid, goaway_error_code code)
+        net::awaitable<void> send_goaway(uint32_t last_sid, http2_error_code code)
         {
             uint8_t buf[64] = {0};
             goaway_frame gf(buf, sizeof(buf), false);

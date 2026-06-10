@@ -13,7 +13,7 @@
 
 #include <algorithm>
 
-#include "h2_connection.hpp"
+#include "h2x/h2_connection.hpp"
 
 namespace h2x {
     // ═══════════════════════════════════════════════════════════════
@@ -363,7 +363,7 @@ namespace h2x {
          *
          * @param code RST 错误码，默认使用 CANCEL。
          */
-        net::awaitable<void> cancel(rst_stream_error_code code = rst_stream_error_code::CANCEL)
+        net::awaitable<void> cancel(http2_error_code code = http2_error_code::CANCEL)
         {
             co_await conn_.send_rst_stream(stream_id_, code);
             co_return;
