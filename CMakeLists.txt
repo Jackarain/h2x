@@ -6,6 +6,8 @@ project(h2x LANGUAGES CXX)
 
 ################################################################################
 
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${PROJECT_SOURCE_DIR}" "${PROJECT_SOURCE_DIR}/cmake")
+
 include(CheckCXXCompilerFlag)
 include(CheckLibraryExists)
 
