@@ -23,7 +23,7 @@
 #include <cstring>
 #include <limits>
 
-#include "h2_global_data.hpp"
+#include "h2x/h2_global_data.hpp"
 
 
 namespace h2x {

@@ -11,7 +11,7 @@
 #ifndef H2X_HTTP2_HPP
 #define H2X_HTTP2_HPP
 
-#include "h2_connection.hpp"
-#include "h2_stream.hpp"
+#include "h2x/h2_connection.hpp"
+#include "h2x/h2_stream.hpp"
 
 #endif // H2X_HTTP2_HPP
