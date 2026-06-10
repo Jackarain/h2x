@@ -1165,7 +1165,7 @@ namespace h2x {
             if (pad_length_ > 0) {
                 payload_size += 1 + pad_length_;  // 1 字节用于存储 pad_length，pad_length 字节用于填充
             }
-            this->payload_size(payload_size);
+            this->payload_size(static_cast<uint32_t>(payload_size));
 
             // 设置标志位
             uint8_t frame_flags = 0;
@@ -1207,7 +1207,7 @@ namespace h2x {
                 std::memset(payload + offset, 0, pad_length_);
             }
 
-            return 9 + payload_size;
+            return static_cast<int>(9 + payload_size);
         }
 
         // 获取承诺的流 ID
@@ -1314,7 +1314,7 @@ namespace h2x {
         int pack_payload()
         {
             size_t payload_size = header_block_fragment_.size();
-            this->payload_size(payload_size);
+            this->payload_size(static_cast<uint32_t>(payload_size));
 
             // 设置 END_HEADERS 标志位
             if (end_headers_) {
@@ -1329,7 +1329,7 @@ namespace h2x {
                 std::memcpy(payload, header_block_fragment_.data(), payload_size);
             }
 
-            return 9 + payload_size;
+            return static_cast<int>(9 + payload_size);
         }
 
         // 获取头部块片段
@@ -1436,7 +1436,7 @@ namespace h2x {
                 total_size += 1 + pad_length_;  // 1 字节用于存储 pad_length，pad_length 字节用于填充
             }
 
-            this->payload_size(total_size);
+            this->payload_size(static_cast<uint32_t>(total_size));
 
             // 设置标志位
             uint8_t frame_flags = 0;
@@ -1471,7 +1471,7 @@ namespace h2x {
                 std::memset(payload + offset, 0, pad_length_);
             }
 
-            return 9 + total_size;
+            return static_cast<int>(9 + total_size);
         }
 
         // 获取数据内容
@@ -1568,7 +1568,7 @@ namespace h2x {
         {
             size_t debug_data_size = debug_data_.size();
             size_t payload_size = 8 + debug_data_size;
-            this->payload_size(payload_size);
+            this->payload_size(static_cast<uint32_t>(payload_size));
 
             uint8_t* payload = this->payload();
 
@@ -1589,7 +1589,7 @@ namespace h2x {
                 std::memcpy(payload + 8, debug_data_.data(), debug_data_size);
             }
 
-            return 9 + payload_size;
+            return static_cast<int>(9 + payload_size);
         }
 
         uint32_t get_last_stream_id() const { return last_stream_id_; }

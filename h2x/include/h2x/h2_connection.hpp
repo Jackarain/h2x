@@ -560,7 +560,7 @@ namespace h2x {
             data_frame df(fc.data_, fc.size_);
 
             // 更新流控窗口.
-            size_t data_len = df.get_data().size();
+            int64_t data_len = static_cast<int64_t>(df.get_data().size());
             if (data_len > sd.local_window) {
                 co_await send_rst_stream(sid, http2_error_code::FLOW_CONTROL_ERROR);
                 co_return;
@@ -568,16 +568,18 @@ namespace h2x {
             sd.local_window -= data_len;
 
             // 检查是否需要更新流级窗口.
-            if (sd.local_window < settings_.initial_window_size / 2) {
-                uint32_t increment = settings_.initial_window_size - sd.local_window;
+            if (sd.local_window < static_cast<int64_t>(settings_.initial_window_size / 2)) {
+                uint32_t increment = static_cast<uint32_t>(
+                    static_cast<int64_t>(settings_.initial_window_size) - sd.local_window);
                 co_await send_window_update(sid, increment);
                 sd.local_window = settings_.initial_window_size;
             }
 
             // 检查是否需要更新连接级窗口.
             conn_local_window_ -= data_len;
-            if (conn_local_window_ < settings_.initial_window_size / 2) {
-                uint32_t increment = settings_.initial_window_size - conn_local_window_;
+            if (conn_local_window_ < static_cast<int64_t>(settings_.initial_window_size / 2)) {
+                uint32_t increment = static_cast<uint32_t>(
+                    static_cast<int64_t>(settings_.initial_window_size) - conn_local_window_);
                 co_await send_window_update(0, increment);
                 conn_local_window_ = settings_.initial_window_size;
             }
