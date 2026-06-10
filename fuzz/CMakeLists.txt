@@ -33,6 +33,12 @@ set(H2X_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/..")
 option(STANDALONE_FUZZER
     "Build with standalone fuzz driver (no libFuzzer dependency)" OFF)
 
+# -static-libstdc++ conflicts with clang's -fsanitize=fuzzer, so remove it.
+if (NOT STANDALONE_FUZZER)
+    string(REPLACE "-static-libstdc++" "" CMAKE_EXE_LINKER_FLAGS
+        "${CMAKE_EXE_LINKER_FLAGS}")
+endif()
+
 # --- helper: define a fuzz executable ---
 function(add_h2x_fuzz TARGET SOURCE)
     add_executable(${TARGET} ${SOURCE})
