@@ -88,7 +88,7 @@ namespace h2x {
 
 
     enum class http2_error_code : uint32_t {
-        NO_ERROR = 0x00,
+        H2_NO_ERROR = 0x00,
         PROTOCOL_ERROR = 0x01,
         INTERNAL_ERROR = 0x02,
         FLOW_CONTROL_ERROR = 0x03,
@@ -107,7 +107,7 @@ namespace h2x {
     inline std::string http2_error_code_to_string(http2_error_code code)
     {
         switch (code) {
-        case http2_error_code::NO_ERROR:  return "NO_ERROR";
+        case http2_error_code::H2_NO_ERROR:  return "H2_NO_ERROR";
         case http2_error_code::PROTOCOL_ERROR: return "PROTOCOL_ERROR";
         case http2_error_code::INTERNAL_ERROR: return "INTERNAL_ERROR";
         case http2_error_code::FLOW_CONTROL_ERROR: return "FLOW_CONTROL_ERROR";
