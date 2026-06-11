@@ -24,11 +24,7 @@ inline std::ostream& operator<<(std::ostream& os, frame_type ft)
 {
     return os << static_cast<int>(ft);
 }
-inline std::ostream& operator<<(std::ostream& os, rst_stream_error_code ec)
-{
-    return os << static_cast<int>(ec);
-}
-inline std::ostream& operator<<(std::ostream& os, goaway_error_code ec)
+inline std::ostream& operator<<(std::ostream& os, http2_error_code ec)
 {
     return os << static_cast<int>(ec);
 }
@@ -421,7 +417,7 @@ BOOST_AUTO_TEST_CASE(pack_unpack_rst_stream)
     buf[3] = static_cast<uint8_t>(frame_type::RST_STREAM);
 
     rst_stream_frame rf(buf, sizeof(buf), false);
-    rf.set_error_code(rst_stream_error_code::CANCEL);
+    rf.set_error_code(http2_error_code::CANCEL);
     rf.stream_id(1);
 
     int total = rf.pack_payload();
@@ -429,26 +425,26 @@ BOOST_AUTO_TEST_CASE(pack_unpack_rst_stream)
 
     rst_stream_frame rf2(buf, sizeof(buf));
     BOOST_CHECK_EQUAL(rf2.stream_id(), 1u);
-    BOOST_CHECK_EQUAL(rf2.get_error_code(), rst_stream_error_code::CANCEL);
+    BOOST_CHECK_EQUAL(rf2.get_error_code(), http2_error_code::CANCEL);
 }
 
 BOOST_AUTO_TEST_CASE(all_error_codes)
 {
-    std::vector<rst_stream_error_code> codes = {
-        rst_stream_error_code::NO_ERROR,
-        rst_stream_error_code::PROTOCOL_ERROR,
-        rst_stream_error_code::INTERNAL_ERROR,
-        rst_stream_error_code::FLOW_CONTROL_ERROR,
-        rst_stream_error_code::SETTINGS_TIMEOUT,
-        rst_stream_error_code::STREAM_CLOSED,
-        rst_stream_error_code::FRAME_SIZE_ERROR,
-        rst_stream_error_code::REFUSED_STREAM,
-        rst_stream_error_code::CANCEL,
-        rst_stream_error_code::COMPRESSION_ERROR,
-        rst_stream_error_code::CONNECT_ERROR,
-        rst_stream_error_code::ENHANCE_YOUR_CALM,
-        rst_stream_error_code::INADEQUATE_SECURITY,
-        rst_stream_error_code::HTTP_1_1_REQUIRED,
+    std::vector<http2_error_code> codes = {
+        http2_error_code::H2_NO_ERROR,
+        http2_error_code::PROTOCOL_ERROR,
+        http2_error_code::INTERNAL_ERROR,
+        http2_error_code::FLOW_CONTROL_ERROR,
+        http2_error_code::SETTINGS_TIMEOUT,
+        http2_error_code::STREAM_CLOSED,
+        http2_error_code::FRAME_SIZE_ERROR,
+        http2_error_code::REFUSED_STREAM,
+        http2_error_code::CANCEL,
+        http2_error_code::COMPRESSION_ERROR,
+        http2_error_code::CONNECT_ERROR,
+        http2_error_code::ENHANCE_YOUR_CALM,
+        http2_error_code::INADEQUATE_SECURITY,
+        http2_error_code::HTTP_1_1_REQUIRED,
     };
 
     for (auto code : codes) {
@@ -478,14 +474,14 @@ BOOST_AUTO_TEST_CASE(invalid_type)
 
 BOOST_AUTO_TEST_CASE(error_code_to_string)
 {
-    BOOST_CHECK_EQUAL(rst_stream_error_code_to_string(rst_stream_error_code::NO_ERROR),
-        "NO_ERROR");
-    BOOST_CHECK_EQUAL(rst_stream_error_code_to_string(rst_stream_error_code::CANCEL),
+    BOOST_CHECK_EQUAL(http2_error_code_to_string(http2_error_code::H2_NO_ERROR),
+        "H2_NO_ERROR");
+    BOOST_CHECK_EQUAL(http2_error_code_to_string(http2_error_code::CANCEL),
         "CANCEL");
-    BOOST_CHECK_EQUAL(rst_stream_error_code_to_string(rst_stream_error_code::PROTOCOL_ERROR),
+    BOOST_CHECK_EQUAL(http2_error_code_to_string(http2_error_code::PROTOCOL_ERROR),
         "PROTOCOL_ERROR");
-    BOOST_CHECK_EQUAL(rst_stream_error_code_to_string(
-        static_cast<rst_stream_error_code>(0xFF)), "UNKNOWN");
+    BOOST_CHECK_EQUAL(http2_error_code_to_string(
+        static_cast<http2_error_code>(0xFF)), "UNKNOWN");
 }
 
 BOOST_AUTO_TEST_SUITE_END()
@@ -577,14 +573,14 @@ BOOST_AUTO_TEST_CASE(pack_unpack_goaway)
     goaway_frame gf(buf, sizeof(buf), false);
     gf.stream_id(0);
     gf.set_last_stream_id(100);
-    gf.set_error_code(goaway_error_code::NO_ERROR);
+    gf.set_error_code(http2_error_code::H2_NO_ERROR);
 
     int total = gf.pack_payload();
     BOOST_CHECK_EQUAL(total, 17); // 9 + 8
 
     goaway_frame gf2(buf, sizeof(buf));
     BOOST_CHECK_EQUAL(gf2.get_last_stream_id(), 100u);
-    BOOST_CHECK_EQUAL(gf2.get_error_code(), goaway_error_code::NO_ERROR);
+    BOOST_CHECK_EQUAL(gf2.get_error_code(), http2_error_code::H2_NO_ERROR);
 }
 
 BOOST_AUTO_TEST_CASE(goaway_with_debug_data)
@@ -595,7 +591,7 @@ BOOST_AUTO_TEST_CASE(goaway_with_debug_data)
     goaway_frame gf(buf, sizeof(buf), false);
     gf.stream_id(0);
     gf.set_last_stream_id(0);
-    gf.set_error_code(goaway_error_code::INTERNAL_ERROR);
+    gf.set_error_code(http2_error_code::INTERNAL_ERROR);
 
     std::vector<uint8_t> debug = {'d', 'e', 'b', 'u', 'g'};
     gf.set_debug_data(debug);
@@ -611,21 +607,21 @@ BOOST_AUTO_TEST_CASE(goaway_with_debug_data)
 
 BOOST_AUTO_TEST_CASE(all_error_codes)
 {
-    std::vector<goaway_error_code> codes = {
-        goaway_error_code::NO_ERROR,
-        goaway_error_code::PROTOCOL_ERROR,
-        goaway_error_code::INTERNAL_ERROR,
-        goaway_error_code::FLOW_CONTROL_ERROR,
-        goaway_error_code::SETTINGS_TIMEOUT,
-        goaway_error_code::STREAM_CLOSED,
-        goaway_error_code::FRAME_SIZE_ERROR,
-        goaway_error_code::REFUSED_STREAM,
-        goaway_error_code::CANCEL,
-        goaway_error_code::COMPRESSION_ERROR,
-        goaway_error_code::CONNECT_ERROR,
-        goaway_error_code::ENHANCE_YOUR_CALM,
-        goaway_error_code::INADEQUATE_SECURITY,
-        goaway_error_code::HTTP_1_1_REQUIRED,
+    std::vector<http2_error_code> codes = {
+        http2_error_code::H2_NO_ERROR,
+        http2_error_code::PROTOCOL_ERROR,
+        http2_error_code::INTERNAL_ERROR,
+        http2_error_code::FLOW_CONTROL_ERROR,
+        http2_error_code::SETTINGS_TIMEOUT,
+        http2_error_code::STREAM_CLOSED,
+        http2_error_code::FRAME_SIZE_ERROR,
+        http2_error_code::REFUSED_STREAM,
+        http2_error_code::CANCEL,
+        http2_error_code::COMPRESSION_ERROR,
+        http2_error_code::CONNECT_ERROR,
+        http2_error_code::ENHANCE_YOUR_CALM,
+        http2_error_code::INADEQUATE_SECURITY,
+        http2_error_code::HTTP_1_1_REQUIRED,
     };
 
     for (auto code : codes) {
@@ -641,16 +637,6 @@ BOOST_AUTO_TEST_CASE(all_error_codes)
         goaway_frame gf2(buf, sizeof(buf));
         BOOST_CHECK_EQUAL(gf2.get_error_code(), code);
     }
-}
-
-BOOST_AUTO_TEST_CASE(error_code_to_string)
-{
-    BOOST_CHECK_EQUAL(goaway_error_code_to_string(goaway_error_code::NO_ERROR),
-        "NO_ERROR");
-    BOOST_CHECK_EQUAL(goaway_error_code_to_string(goaway_error_code::PROTOCOL_ERROR),
-        "PROTOCOL_ERROR");
-    BOOST_CHECK_EQUAL(goaway_error_code_to_string(
-        static_cast<goaway_error_code>(0xFF)), "UNKNOWN");
 }
 
 BOOST_AUTO_TEST_CASE(invalid_type)
