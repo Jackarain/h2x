@@ -36,6 +36,10 @@ set_property(TARGET h2x_test PROPERTY FOLDER "test")
 include(CTest)
 add_test(NAME h2x_test COMMAND h2x_test)
 
+set_tests_properties(h2x_test PROPERTIES
+    ENVIRONMENT "BOOST_TEST_LOG_LEVEL=test_suite"
+)
+
 if(MSVC AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 19.29.30129 AND CMAKE_VERSION VERSION_GREATER 3.20.3)
     set_property(TARGET h2x_test PROPERTY CXX_STANDARD 23)
     message(STATUS "h2x_test set cxx standard: C++23")
