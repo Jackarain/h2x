@@ -203,9 +203,6 @@ co_await conn->async_handshake(role::client, *s, hs_ec);
 
 纯 TCP 模式采用 HTTP/2 prior-knowledge（不使用 ALPN），适合在受控环境或本地测试使用。
 
-## 贡献与沟通
-
-- 欢迎通过 issue / pull request 贡献，提交 PR 时请附带可复现的用例和说明。
 
 ## 许可证
 
