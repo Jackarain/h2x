@@ -8,6 +8,8 @@
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 
+// 简单的 HTTP/2 客户端示例.
+
 #include <iostream>
 #include <string>
 #include <vector>

@@ -8,6 +8,8 @@
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 
+// 简单的 HTTP/2 服务器示例.
+
 #include <iostream>
 #include <cstdlib>
 #include <string>
