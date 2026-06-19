@@ -643,10 +643,26 @@ namespace h2x {
 
             auto& sd = it->second;
 
-            headers_frame hf(fc.data_, fc.size_, true, &dynamic_table_);
+            // 只解析 flags，不解码 HPACK（避免在 end_headers_=false 时解析截断数据导致异常）.
+            headers_frame hf(fc.data_, fc.size_, false, &dynamic_table_);
+            hf.parse_flags();
 
             if (hf.end_headers_) {
-                // 完整头部块到达 — 解析 entry 并加入动态表.
+                // 完整头部块到达 — 执行完整 HPACK 解析.
+                bool hpack_error = false;
+                try {
+                    hf.unpack_headers();
+                } catch (const std::exception&) {
+                    hpack_error = true;
+                }
+
+                if (hpack_error) {
+                    co_await send_goaway(sid, http2_error_code::COMPRESSION_ERROR);
+                    abort_ = true;
+                    co_return;
+                }
+
+                // 解析 entry 并加入动态表.
                 for (auto& h : hf.headers_) {
                     if (h.type_ == &G_LITERAL_INCREMENTAL_INDEXING) {
                         add_to_dynamic_table(h);
@@ -679,17 +695,34 @@ namespace h2x {
                 sd.pending_end_stream = hf.end_stream_;
                 auto payload = fc.payload();
                 auto plen = fc.payload_size();
-                // 跳过 priority / padding 前缀 (与 unpack_headers 逻辑保持一致).
+                // 跳过 padding / priority 前缀 (与 unpack_headers 逻辑保持一致).
                 size_t offset = 0;
+                uint8_t pad_len = 0;
                 if (hf.padded_) {
+                    if (plen < 1) {
+                        co_await send_goaway(sid, http2_error_code::PROTOCOL_ERROR);
+                        abort_ = true;
+                        co_return;
+                    }
+                    pad_len = payload[0];
+                    if (pad_len >= plen - 1) {
+                        co_await send_goaway(sid, http2_error_code::PROTOCOL_ERROR);
+                        abort_ = true;
+                        co_return;
+                    }
                     offset += 1;
                 }
                 if (hf.priority_) {
+                    if (plen - offset < 5) {
+                        co_await send_goaway(sid, http2_error_code::PROTOCOL_ERROR);
+                        abort_ = true;
+                        co_return;
+                    }
                     offset += 5;
                 }
                 sd.pending_header_block.insert(
                     sd.pending_header_block.end(),
-                    payload + offset, payload + plen - hf.padding_length_);
+                    payload + offset, payload + plen - pad_len);
             }
 
             co_return;
@@ -843,13 +876,25 @@ namespace h2x {
                 tmp[8] = sid & 0xFF;
                 std::memcpy(tmp.data() + 9, sd.pending_header_block.data(), total);
 
-                headers_frame cont_hf(tmp.data(), tmp.size(), true, &dynamic_table_);
+                // 解析累积的完整头部块，若 HPACK 数据损坏则发送 GOAWAY.
+                bool hpack_error = false;
+                try {
+                    headers_frame cont_hf(tmp.data(), tmp.size(), true, &dynamic_table_);
 
-                for (auto& h : cont_hf.headers_) {
-                    if (h.type_ == &G_LITERAL_INCREMENTAL_INDEXING) {
-                        add_to_dynamic_table(h);
+                    for (auto& h : cont_hf.headers_) {
+                        if (h.type_ == &G_LITERAL_INCREMENTAL_INDEXING) {
+                            add_to_dynamic_table(h);
+                        }
+                        sd.headers.emplace_back(h);
                     }
-                    sd.headers.emplace_back(h);
+                } catch (const std::exception&) {
+                    hpack_error = true;
+                }
+
+                if (hpack_error) {
+                    co_await send_goaway(sid, http2_error_code::COMPRESSION_ERROR);
+                    abort_ = true;
+                    co_return;
                 }
 
                 // 应用分片 HEADERS 帧的 END_STREAM 标志.
