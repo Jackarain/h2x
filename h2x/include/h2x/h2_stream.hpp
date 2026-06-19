@@ -108,28 +108,32 @@ namespace h2x {
             }
 
             // 构建 HEADERS 帧.
-            size_t buf_size = conn_.settings_.max_frame_size + 9;
-            auto buf = std::make_unique<uint8_t[]>(buf_size);
-            std::memset(buf.get(), 0, buf_size);
-
-            headers_frame hf(buf.get(), buf_size, false);
+            auto data = std::vector<uint8_t>(conn_.settings_.max_frame_size + 9);
+            headers_frame hf(data.data(), data.size(), false);
             hf.stream_id(stream_id_);
             hf.end_stream_ = end_stream;
             hf.end_headers_ = true;
 
             for (auto& [name, value] : headers) {
-                hf.add_header(name, value);
+                hf.add_header(name, value,
+                    &conn_.dynamic_table_map_, &conn_.dynamic_table_);
             }
 
             int total = hf.pack_headers();
-            if (total < 0 || static_cast<size_t>(total) > buf_size) {
+            if (total < 0 || static_cast<size_t>(total) > data.size()) {
                 ec = make_error_code(errc::protocol_error);
                 co_return ec;
             }
 
+            // 将 LITERAL_INCREMENTAL_INDEXING 条目加入动态表.
+            for (auto& entry : hf.headers_) {
+                if (entry.type_ == &G_LITERAL_INCREMENTAL_INDEXING) {
+                    conn_.add_to_dynamic_table(entry);
+                }
+            }
+
             // 发送帧.
-            std::vector<uint8_t> data(total);
-            std::memcpy(data.data(), buf.get(), total);
+            data.resize(total);
             conn_.write_frame_data(std::move(data));
 
             // 更新流状态.
@@ -204,10 +208,9 @@ namespace h2x {
 
                 // 构建 DATA 帧.
                 size_t buf_size = chunk + 9 + 1; // +1 for possible padding
-                auto buf = std::make_unique<uint8_t[]>(buf_size);
-                std::memset(buf.get(), 0, buf_size);
+                auto frame_data = std::vector<uint8_t>(buf_size);
 
-                data_frame df(buf.get(), buf_size, false);
+                data_frame df(frame_data.data(), frame_data.size(), false);
                 df.stream_id(stream_id_);
                 df.type(frame_type::DATA);
                 df.set_data(data + offset, chunk);
@@ -218,8 +221,7 @@ namespace h2x {
                 df.pack_payload();
 
                 size_t frame_len = df.frame_size();
-                std::vector<uint8_t> frame_data(frame_len);
-                std::memcpy(frame_data.data(), buf.get(), frame_len);
+                frame_data.resize(frame_len);
                 conn_.write_frame_data(std::move(frame_data));
 
                 // 更新远端窗口（流级和连接级）.

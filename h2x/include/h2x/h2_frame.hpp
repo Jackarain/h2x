@@ -377,29 +377,28 @@ namespace h2x {
     // 注意，hpack 动态索引表，索引从 62 开始，静态索引表索引从 1 开始.
     // 下面是 hpack 动态索引表，索引从 62 开始，最大 1024.
     // 将来移到 connection 类中作为成员变量，每个 connection 有一个动态索引表和静态表(复制一份).
-    /**
-     * @brief 全局 HPACK 动态索引表（简单实现，索引上限 1024）。
-     *
-     * 注意：当前为全局共享表的简化实现；更严谨的实现应当将动态表
-     * 作为 `connection` 的成员以支持每连接独立的表状态。
-     */
-    inline std::array<std::optional<header_entry>, 1024> global_hpack_index_table;
-    // 动态索引表大小, 最大 1024.
-    inline int global_hpack_index_table_size = 0;
-
-    static const header_entry* hpack_index_to_frame(uint32_t index)
+    // 返回静态表中的第 index 项（index 从 1 开始）.
+    static const header_entry* hpack_static_index(uint32_t index)
     {
-        if (index <= 61) {
+        if (index == 0 || index > 61)
+            return nullptr;
+        return &global_static_header_table[index - 1];
+    }
+
+    // 从组合表（静态 + 动态）中按 index 查找 entry.
+    // dynamic_table 可选；为 nullptr 时只查静态表（index 1-61）。
+    static const header_entry* hpack_index_to_frame(
+        uint32_t index,
+        const std::vector<header_entry>* dynamic_table = nullptr)
+    {
+        if (index <= 61)
             return &global_static_header_table[index - 1];
-        }
 
-        if (index <= static_cast<uint32_t>(global_hpack_index_table_size + 61)) {
-            auto& entry = global_hpack_index_table[index - 61 - 1];
-            if (entry.has_value()) {
-                return &entry.value();
-            }
+        if (dynamic_table) {
+            auto dyn_idx = index - 61 - 1; // 动态表索引从 62 开始
+            if (dyn_idx < dynamic_table->size())
+                return &(*dynamic_table)[dyn_idx];
         }
-
         return nullptr;
     }
 
@@ -720,8 +719,10 @@ namespace h2x {
             data[3] = value & 0xFF;
         }
 
-        headers_frame(uint8_t* data, size_t size, bool unpack = true)
+        headers_frame(uint8_t* data, size_t size, bool unpack = true,
+                      const std::vector<header_entry>* dyn_table = nullptr)
             : frame_codec(data, size)
+            , dynamic_table_(dyn_table)
         {
             if (unpack) {
                 if (type() != frame_type::HEADERS) {
@@ -729,6 +730,12 @@ namespace h2x {
                 }
                 unpack_headers();
             }
+        }
+
+        // 设置动态表指针（用于解码时查找索引 > 61 的表项）。
+        void set_dynamic_table(const std::vector<header_entry>* dt)
+        {
+            dynamic_table_ = dt;
         }
 
         // 提取 flag 解析逻辑
@@ -988,12 +995,11 @@ namespace h2x {
             uint64_t index = 0;
             int nbytes = hpack_unpack_integer({payload, size}, op->nbits_, index);
 
-            if (nbytes < 0 || index < 1 ||
-                index > (uint64_t)global_hpack_index_table_size + 61) {
+            if (nbytes < 0 || index < 1) {
                 throw std::runtime_error("headers_frame: invalid index");
             }
 
-            auto frame = hpack_index_to_frame(static_cast<uint32_t>(index));
+            auto frame = hpack_index_to_frame(static_cast<uint32_t>(index), dynamic_table_);
             if (!frame) {
                 throw std::runtime_error("headers_frame: index out of range");
             }
@@ -1050,7 +1056,7 @@ namespace h2x {
                     throw std::runtime_error("headers_frame: invalid integer");
                 }
 
-                auto frame = hpack_index_to_frame(static_cast<uint32_t>(index));
+                auto frame = hpack_index_to_frame(static_cast<uint32_t>(index), dynamic_table_);
                 if (!frame) {
                     throw std::runtime_error("headers_frame: index out of range");
                 }
@@ -1076,20 +1082,39 @@ namespace h2x {
             return nbytes;
         }
 
-        void add_header(const std::string& name, const std::string& value)
+        void add_header(const std::string& name, const std::string& value,
+                       const std::unordered_map<uint32_t, int>* dyn_table_map = nullptr,
+                       const std::vector<header_entry>* dyn_table = nullptr)
         {
             auto uhash = frame_header_hash({0, name, value, 0, nullptr});
 
+            // 检查静态表.
             auto it = global_static_header_table_map.find(uhash);
             if (it != global_static_header_table_map.end()) {
                 headers_.push_back(global_static_header_table[it->second]);
-            } else {
-                headers_.push_back({0, name, value, uhash, &G_LITERAL_INCREMENTAL_INDEXING});
+                return;
             }
+
+            // 检查动态表.
+            if (dyn_table_map && dyn_table) {
+                auto dit = dyn_table_map->find(uhash);
+                if (dit != dyn_table_map->end()) {
+                    if (static_cast<size_t>(dit->second) < dyn_table->size()) {
+                        headers_.push_back((*dyn_table)[dit->second]);
+                        headers_.back().type_ = &G_INDEXED;
+                        return;
+                    }
+                }
+            }
+
+            headers_.push_back({0, name, value, uhash, &G_LITERAL_INCREMENTAL_INDEXING});
         }
 
         std::vector<header_entry> headers_;
         std::optional<size_t> dynamic_table_size_update_;
+
+        // 指向 connection 动态表的指针（用于解码索引 > 61 的表项）。
+        const std::vector<header_entry>* dynamic_table_ = nullptr;
 
         bool end_stream_ = false;
         bool end_headers_ = false;

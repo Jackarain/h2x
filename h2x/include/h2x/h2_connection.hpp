@@ -138,6 +138,7 @@ namespace h2x {
             , dynamic_table_map_(std::move(other.dynamic_table_map_))
             , dynamic_table_(std::move(other.dynamic_table_))
             , streams_(std::move(other.streams_))
+            , pump_buf_(std::move(other.pump_buf_))
         {}
 
         connection& operator=(connection&& other)
@@ -150,6 +151,7 @@ namespace h2x {
                 dynamic_table_map_ = std::move(other.dynamic_table_map_);
                 dynamic_table_ = std::move(other.dynamic_table_);
                 streams_ = std::move(other.streams_);
+                pump_buf_ = std::move(other.pump_buf_);
             }
             return *this;
         }
@@ -198,7 +200,7 @@ namespace h2x {
          * @param ec 输出的错误码（通过引用返回）。
          * @return awaitable<void>
          */
-        net::awaitable<void> async_handshake(role r, settings& s, boost::system::error_code& ec)
+        net::awaitable<void> async_handshake(role r, const settings& s, boost::system::error_code& ec)
         {
             role_ = r;
 
@@ -286,6 +288,9 @@ namespace h2x {
 
                 // 更新协商后的配置.
                 settings_ = s;
+
+                // 初始化 pump 缓冲区（持久分配，避免每帧分配）.
+                pump_buf_.reset(new uint8_t[settings_.max_frame_size + 9]);
 
                 // 在后台启动输入/输出 pump 协程，async_handshake 将正常返回.
                 auto exit_flag = pump_done_;
@@ -638,33 +643,53 @@ namespace h2x {
 
             auto& sd = it->second;
 
-            headers_frame hf(fc.data_, fc.size_);
+            headers_frame hf(fc.data_, fc.size_, true, &dynamic_table_);
 
-            // 存储头部到流.
-            for (auto& h : hf.headers_) {
-                sd.headers.emplace_back(h);
-            }
-
-            if (hf.end_stream_) {
-                // 仅在流已被 async_accept 拾取后（非 idle）才更新状态.
-                if (sd.state != stream_state::idle) {
-                    sd.state = (sd.state == stream_state::half_closed_local)
-                        ? stream_state::closed
-                        : stream_state::half_closed_remote;
+            if (hf.end_headers_) {
+                // 完整头部块到达 — 解析 entry 并加入动态表.
+                for (auto& h : hf.headers_) {
+                    if (h.type_ == &G_LITERAL_INCREMENTAL_INDEXING) {
+                        add_to_dynamic_table(h);
+                    }
+                    sd.headers.emplace_back(h);
                 }
-                sd.remote_end_stream = true;
-            }
 
-            // 通知等待的读取者.
-            if (sd.read_waiter) {
-                sd.read_waiter();
-                sd.read_waiter = nullptr;
-            }
+                if (hf.end_stream_) {
+                    if (sd.state != stream_state::idle) {
+                        sd.state = (sd.state == stream_state::half_closed_local)
+                            ? stream_state::closed
+                            : stream_state::half_closed_remote;
+                    }
+                    sd.remote_end_stream = true;
+                }
 
-            // 通知 async_accept 有新流到达.
-            if (accept_waiter_) {
-                accept_waiter_();
-                accept_waiter_ = nullptr;
+                // 通知等待的读取者.
+                if (sd.read_waiter) {
+                    sd.read_waiter();
+                    sd.read_waiter = nullptr;
+                }
+
+                // 通知 async_accept 有新流到达.
+                if (accept_waiter_) {
+                    accept_waiter_();
+                    accept_waiter_ = nullptr;
+                }
+            } else {
+                // 头部块有后续 CONTINUATION 帧 — 暂存原始 payload.
+                sd.pending_end_stream = hf.end_stream_;
+                auto payload = fc.payload();
+                auto plen = fc.payload_size();
+                // 跳过 priority / padding 前缀 (与 unpack_headers 逻辑保持一致).
+                size_t offset = 0;
+                if (hf.padded_) {
+                    offset += 1;
+                }
+                if (hf.priority_) {
+                    offset += 5;
+                }
+                sd.pending_header_block.insert(
+                    sd.pending_header_block.end(),
+                    payload + offset, payload + plen - hf.padding_length_);
             }
 
             co_return;
@@ -791,13 +816,66 @@ namespace h2x {
             continuation_frame cf(fc.data_, fc.size_);
 
             auto it = streams_.find(sid);
-            if (it != streams_.end()) {
-                // 累积 CONTINUATION 的头部数据.
-                auto& frag = cf.get_header_block_fragment();
-                it->second.pending_header_block.insert(
-                    it->second.pending_header_block.end(),
-                    frag.begin(), frag.end());
+            if (it == streams_.end()) {
+                co_return;
             }
+
+            auto& sd = it->second;
+
+            // 累积本次 CONTINUATION 的头部块片段.
+            auto& frag = cf.get_header_block_fragment();
+            sd.pending_header_block.insert(
+                sd.pending_header_block.end(),
+                frag.begin(), frag.end());
+
+            if (cf.is_end_headers() && !sd.pending_header_block.empty()) {
+                // 最后一块到达 — 构造合成 HEADERS 帧来解析完整头部块.
+                auto total = sd.pending_header_block.size();
+                std::vector<uint8_t> tmp(total + 9);
+                tmp[3] = static_cast<uint8_t>(frame_type::HEADERS);
+                tmp[4] = static_cast<uint8_t>(frame_flag::END_HEADERS);
+                tmp[0] = (total >> 16) & 0xFF;
+                tmp[1] = (total >> 8) & 0xFF;
+                tmp[2] = total & 0xFF;
+                tmp[5] = (sid >> 24) & 0xFF;
+                tmp[6] = (sid >> 16) & 0xFF;
+                tmp[7] = (sid >> 8) & 0xFF;
+                tmp[8] = sid & 0xFF;
+                std::memcpy(tmp.data() + 9, sd.pending_header_block.data(), total);
+
+                headers_frame cont_hf(tmp.data(), tmp.size(), true, &dynamic_table_);
+
+                for (auto& h : cont_hf.headers_) {
+                    if (h.type_ == &G_LITERAL_INCREMENTAL_INDEXING) {
+                        add_to_dynamic_table(h);
+                    }
+                    sd.headers.emplace_back(h);
+                }
+
+                // 应用分片 HEADERS 帧的 END_STREAM 标志.
+                if (sd.pending_end_stream) {
+                    if (sd.state != stream_state::idle) {
+                        sd.state = (sd.state == stream_state::half_closed_local)
+                            ? stream_state::closed
+                            : stream_state::half_closed_remote;
+                    }
+                    sd.remote_end_stream = true;
+                    sd.pending_end_stream = false;
+                }
+
+                if (sd.read_waiter) {
+                    sd.read_waiter();
+                    sd.read_waiter = nullptr;
+                }
+
+                if (accept_waiter_) {
+                    accept_waiter_();
+                    accept_waiter_ = nullptr;
+                }
+
+                sd.pending_header_block.clear();
+            }
+
             co_return;
         }
 
@@ -805,47 +883,41 @@ namespace h2x {
 
         net::awaitable<void> send_rst_stream(uint32_t sid, http2_error_code code)
         {
-            uint8_t buf[64] = {0};
-            rst_stream_frame rf(buf, sizeof(buf), false);
+            auto buf = std::vector<uint8_t>(64, 0);
+            rst_stream_frame rf(buf.data(), buf.size(), false);
             rf.stream_id(sid);
             rf.type(frame_type::RST_STREAM);
             rf.set_error_code(code);
             rf.pack_payload();
-
-            std::vector<uint8_t> data(rf.frame_size());
-            std::memcpy(data.data(), rf.data_, rf.frame_size());
-            write_frame_data(std::move(data));
+            buf.resize(rf.frame_size());
+            write_frame_data(std::move(buf));
             co_return;
         }
 
         net::awaitable<void> send_window_update(uint32_t sid, uint32_t increment)
         {
-            uint8_t buf[64] = {0};
-            window_update_frame wuf(buf, sizeof(buf), false);
+            auto buf = std::vector<uint8_t>(64, 0);
+            window_update_frame wuf(buf.data(), buf.size(), false);
             wuf.stream_id(sid);
             wuf.type(frame_type::WINDOW_UPDATE);
             wuf.set_window_increment(increment);
             wuf.pack_payload();
-
-            std::vector<uint8_t> data(wuf.frame_size());
-            std::memcpy(data.data(), wuf.data_, wuf.frame_size());
-            write_frame_data(std::move(data));
+            buf.resize(wuf.frame_size());
+            write_frame_data(std::move(buf));
             co_return;
         }
 
         net::awaitable<void> send_goaway(uint32_t last_sid, http2_error_code code)
         {
-            uint8_t buf[64] = {0};
-            goaway_frame gf(buf, sizeof(buf), false);
+            auto buf = std::vector<uint8_t>(64, 0);
+            goaway_frame gf(buf.data(), buf.size(), false);
             gf.stream_id(0);
             gf.type(frame_type::GOAWAY);
             gf.set_last_stream_id(last_sid);
             gf.set_error_code(code);
             gf.pack_payload();
-
-            std::vector<uint8_t> data(gf.frame_size());
-            std::memcpy(data.data(), gf.data_, gf.frame_size());
-            write_frame_data(std::move(data));
+            buf.resize(gf.frame_size());
+            write_frame_data(std::move(buf));
             co_return;
         }
 
@@ -864,22 +936,40 @@ namespace h2x {
         // 向动态表添加 entry.
         void add_to_dynamic_table(const header_entry& entry)
         {
+            // RFC 7541 §4.1: entry 的字节大小 = name 长度 + value 长度 + 32.
+            size_t entry_size = 32;
+            if (entry.name_) entry_size += entry.name_->size();
+            if (entry.value_) entry_size += entry.value_->size();
+
             size_t max_size = settings_.header_table_size;
 
-            // 如果动态表满了，移除最旧的条目.
-            while (!dynamic_table_.empty() &&
-                   dynamic_table_.size() >= max_size / 32) {
+            // 如果单个 entry 超过上限，则清空整个表.
+            if (entry_size > max_size) {
+                dynamic_table_.clear();
+                dynamic_table_map_.clear();
+                dynamic_table_size_ = 0;
+                return;
+            }
+
+            // 移除最旧的条目直到有足够空间.
+            while (dynamic_table_size_ + entry_size > max_size &&
+                   !dynamic_table_.empty()) {
                 auto& old = dynamic_table_.back();
+                size_t old_size = 32;
+                if (old.name_) old_size += old.name_->size();
+                if (old.value_) old_size += old.value_->size();
+                dynamic_table_size_ -= old_size;
                 dynamic_table_map_.erase(old.hash_);
                 dynamic_table_.pop_back();
             }
 
             dynamic_table_.insert(dynamic_table_.begin(), entry);
+            dynamic_table_size_ += entry_size;
             dynamic_table_map_[entry.hash_] = 0;
 
             // 重新索引.
-            for (size_t i = 0; i < dynamic_table_.size(); ++i) {
-                dynamic_table_map_[dynamic_table_[i].hash_] = static_cast<int>(i);
+            for (size_t i = dynamic_table_.size(); i > 0; --i) {
+                dynamic_table_map_[dynamic_table_[i - 1].hash_] = static_cast<int>(i - 1);
             }
         }
 
@@ -914,9 +1004,8 @@ namespace h2x {
             boost::system::error_code ec;
 
             while (!abort_) {
-                // 分配帧缓冲区.
-                auto frame_buf = std::make_unique<uint8_t[]>(settings_.max_frame_size + 9);
-                frame_codec fc(frame_buf.get(), settings_.max_frame_size + 9);
+                // 使用持久分配缓冲区，避免每次迭代重复分配.
+                frame_codec fc(pump_buf_.get(), settings_.max_frame_size + 9);
 
                 // 异步读取帧.
                 co_await async_read_frame(fc, ec);
@@ -974,9 +1063,13 @@ namespace h2x {
         // hash 表, 用于快速查找动态表中的索引.
         std::unordered_map<uint32_t, int> dynamic_table_map_;
         std::vector<header_entry> dynamic_table_;
+        size_t dynamic_table_size_ = 0;
 
         // 用于标记是否需要中止连接.
         std::atomic_bool abort_{false};
+
+        // pump 缓冲区（持久分配，避免每次 pump_in 迭代重复分配）.
+        std::unique_ptr<uint8_t[]> pump_buf_;
 
         // pump 协程退出标志（pump_in/pump_out 完成时设为 true）.
         std::shared_ptr<std::atomic<bool>> pump_done_{
@@ -993,6 +1086,7 @@ namespace h2x {
             bool is_remote_initiated = false;
             bool remote_end_stream = false;
             bool reset_received = false;
+            bool pending_end_stream = false;  // 暂存分片 HEADERS 的 END_STREAM 标志.
 
             // 流控窗口.
             int64_t local_window = 65535;
