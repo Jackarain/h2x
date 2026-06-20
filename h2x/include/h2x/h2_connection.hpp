@@ -239,7 +239,7 @@ namespace h2x {
                 }
 
                 // 发送连接设置帧.
-                uint8_t bufs[64] = {0};
+                uint8_t bufs[256] = {0};
 
                 settings_frame sf(bufs, sizeof(bufs), false);
 
@@ -266,7 +266,15 @@ namespace h2x {
                     co_return;
                 }
 
+                // 检查帧类型，确保收到的是 SETTINGS 帧.
+                if (sf.type() != frame_type::SETTINGS) {
+                    ec = make_error_code(errc::protocol_error);
+                    co_return;
+                }
+
                 // 解析对方的连接设置帧, 更新本地配置.
+                sf.entries_.clear();
+                sf.unpack_settings();
                 apply_peer_settings(sf.entries_);
 
                 // 发送连接设置帧 ACK.
@@ -299,6 +307,14 @@ namespace h2x {
                         using namespace net::experimental::awaitable_operators;
                         co_await (pump_in() && pump_out());
                         *exit_flag = true;
+                        // pump 退出后, 标记所有流为已重置并唤醒等待者,
+                        // 确保任何阻塞在 wait_until 的协程能被唤醒并退出.
+                        for (auto& [id, sd] : streams_) {
+                            sd.reset_received = true;
+                            if (sd.read_waiter) { sd.read_waiter(); sd.read_waiter = nullptr; }
+                            if (sd.write_waiter) { sd.write_waiter(); sd.write_waiter = nullptr; }
+                        }
+                        if (accept_waiter_) { accept_waiter_(); accept_waiter_ = nullptr; }
                     },
                     net::detached);
 
@@ -418,17 +434,20 @@ namespace h2x {
                 co_return 0;
             }
 
-            // 检查帧大小是否超过最大帧大小.
-            auto want_size = fc.payload_size() + 9;
-            if ((want_size > settings_.max_frame_size) ||
-                (want_size > fc.size_)) {
+            auto payload_len = fc.payload_size();
+
+            // 检查帧负载大小是否超过最大帧大小.
+            // settings_.max_frame_size 是最大负载大小（不含帧头 9 字节）.
+            auto total_size = payload_len + 9;
+            if ((payload_len > settings_.max_frame_size) ||
+                (total_size > fc.size_)) {
                 ec = make_error_code(errc::frame_size_error);
                 co_return 0;
             }
 
             // 读取帧数据.
             size = co_await net::async_read(next_layer_,
-                net::buffer(fc.data_ + 9, fc.payload_size()), net_awaitable[ec]);
+                net::buffer(fc.data_ + 9, payload_len), net_awaitable[ec]);
             if (ec) {
                 co_return 0;
             }
@@ -451,6 +470,38 @@ namespace h2x {
                 } catch (const std::exception&) {
                 }
             });
+        }
+
+        /**
+         * @brief 将 frame_codec 的内容拷贝到新缓冲区并入队发送。
+         *
+         * 用于在处理接收帧后需要回送 ACK 或响应帧的常见场景
+         * 消除 "memcpy + write_frame_data" 的重复代码。
+         */
+        void queue_frame(const frame_codec& fc)
+        {
+            std::vector<uint8_t> buf(fc.frame_size());
+            std::memcpy(buf.data(), fc.data_, fc.frame_size());
+            write_frame_data(std::move(buf));
+        }
+
+        /**
+         * @brief 构建并发送一个简单的控制帧（RST_STREAM / WINDOW_UPDATE / GOAWAY 等）。
+         *
+         * 模板参数 Frame 为帧类型，setup 回调用于设置帧特有字段。
+         */
+        template <class Frame, class Setup>
+        net::awaitable<void> send_control_frame(uint32_t sid, frame_type ft, Setup&& setup)
+        {
+            auto buf = std::vector<uint8_t>(64, 0);
+            Frame f(buf.data(), buf.size(), false);
+            f.stream_id(sid);
+            f.type(ft);
+            std::forward<Setup>(setup)(f);
+            f.pack_payload();
+            buf.resize(f.frame_size());
+            write_frame_data(std::move(buf));
+            co_return;
         }
 
     private:
@@ -743,6 +794,16 @@ namespace h2x {
             if (it != streams_.end()) {
                 it->second.state = stream_state::closed;
                 it->second.reset_received = true;
+
+                // 唤醒该流所有等待者, 使阻塞在 wait_until 的协程即时退出,
+                if (it->second.read_waiter) {
+                    it->second.read_waiter();
+                    it->second.read_waiter = nullptr;
+                }
+                if (it->second.write_waiter) {
+                    it->second.write_waiter();
+                    it->second.write_waiter = nullptr;
+                }
             }
             co_return;
         }
@@ -763,10 +824,7 @@ namespace h2x {
             sf.ack_ = true;
             sf.entries_.clear();
             sf.pack_settings();
-
-            std::vector<uint8_t> buf(sf.frame_size());
-            std::memcpy(buf.data(), sf.data_, sf.frame_size());
-            write_frame_data(std::move(buf));
+            queue_frame(sf);
 
             co_return;
         }
@@ -794,10 +852,7 @@ namespace h2x {
                 // 收到 PING，发送 PING ACK.
                 pf.set_ack(true);
                 pf.pack_payload();
-
-                std::vector<uint8_t> buf(pf.frame_size());
-                std::memcpy(buf.data(), pf.data_, pf.frame_size());
-                write_frame_data(std::move(buf));
+                queue_frame(pf);
             }
             co_return;
         }
@@ -809,6 +864,14 @@ namespace h2x {
             // 记录 GOAWAY 信息并关闭连接.
             last_stream_id_ = gf.get_last_stream_id();
             abort_ = true;
+
+            // GOAWAY 影响所有流: 唤醒所有等待者, 使其即时退出.
+            for (auto& [id, sd] : streams_) {
+                if (sd.read_waiter) { sd.read_waiter(); sd.read_waiter = nullptr; }
+                if (sd.write_waiter) { sd.write_waiter(); sd.write_waiter = nullptr; }
+            }
+            if (accept_waiter_) { accept_waiter_(); accept_waiter_ = nullptr; }
+
             co_return;
         }
 
@@ -928,42 +991,26 @@ namespace h2x {
 
         net::awaitable<void> send_rst_stream(uint32_t sid, http2_error_code code)
         {
-            auto buf = std::vector<uint8_t>(64, 0);
-            rst_stream_frame rf(buf.data(), buf.size(), false);
-            rf.stream_id(sid);
-            rf.type(frame_type::RST_STREAM);
-            rf.set_error_code(code);
-            rf.pack_payload();
-            buf.resize(rf.frame_size());
-            write_frame_data(std::move(buf));
-            co_return;
+            co_return co_await send_control_frame<rst_stream_frame>(
+                sid, frame_type::RST_STREAM,
+                [code](auto& f) { f.set_error_code(code); });
         }
 
         net::awaitable<void> send_window_update(uint32_t sid, uint32_t increment)
         {
-            auto buf = std::vector<uint8_t>(64, 0);
-            window_update_frame wuf(buf.data(), buf.size(), false);
-            wuf.stream_id(sid);
-            wuf.type(frame_type::WINDOW_UPDATE);
-            wuf.set_window_increment(increment);
-            wuf.pack_payload();
-            buf.resize(wuf.frame_size());
-            write_frame_data(std::move(buf));
-            co_return;
+            co_return co_await send_control_frame<window_update_frame>(
+                sid, frame_type::WINDOW_UPDATE,
+                [increment](auto& f) { f.set_window_increment(increment); });
         }
 
         net::awaitable<void> send_goaway(uint32_t last_sid, http2_error_code code)
         {
-            auto buf = std::vector<uint8_t>(64, 0);
-            goaway_frame gf(buf.data(), buf.size(), false);
-            gf.stream_id(0);
-            gf.type(frame_type::GOAWAY);
-            gf.set_last_stream_id(last_sid);
-            gf.set_error_code(code);
-            gf.pack_payload();
-            buf.resize(gf.frame_size());
-            write_frame_data(std::move(buf));
-            co_return;
+            co_return co_await send_control_frame<goaway_frame>(
+                0, frame_type::GOAWAY,
+                [last_sid, code](auto& f) {
+                    f.set_last_stream_id(last_sid);
+                    f.set_error_code(code);
+                });
         }
 
         // ── 动态 HPACK 表操作 ──
@@ -1025,21 +1072,36 @@ namespace h2x {
 
             while (!abort_) {
                 while (out_queue_.empty()) {
-                    if (abort_) co_return;
+                    if (abort_) break;
                     // 输出队列为空时, 等待.
-                    out_notifier_.expires_after(net::chrono::milliseconds(100));
+                    // timer 永不自然超时, 仅靠 write_frame_data 中的
+                    // out_notifier_.cancel() 唤醒.
+                    out_notifier_.expires_at(
+                        net::steady_timer::time_point::max());
                     co_await out_notifier_.async_wait(net_awaitable[ec]);
+                    if (ec == net::error::operation_aborted)
+                        ec.clear(); // 被 write_frame_data 唤醒.
                 }
+                if (abort_) break;
                 // 从输出队列中取出数据.
                 auto data = std::move(out_queue_.front());
                 out_queue_.pop_front();
                 // 异步发送数据.
                 co_await net::async_write(next_layer_, net::buffer(data), net_awaitable[ec]);
                 if (ec) {
-                    co_return;
+                    if (!abort_) {
+                        abort_ = true;
+                    }
+                    break;
                 }
             }
 
+            // pump_out 退出时, 关闭 socket 取消 pump_in 的 async_read,
+            // 确保 pump_in 不会永久阻塞 (与 pump_in 的退出处理对称).
+            {
+                boost::system::error_code ignored;
+                next_layer_.lowest_layer().close(ignored);
+            }
             co_return;
         }
 
@@ -1058,13 +1120,36 @@ namespace h2x {
                     if (!abort_) {
                         abort_ = true;
                     }
-                    co_return;
+                    break;
                 }
 
                 // 分派帧处理.
-                co_await handle_frame(fc);
+                // 使用 try/catch 防止 handle_frame (或其调用的
+                // send_control_frame / pack_payload 等) 抛出异常时,
+                // pump_in 直接退出而跳过下方的清理逻辑, 导致 pump_out
+                // 永久阻塞在 out_notifier_.async_wait() 上, 进而使
+                // (pump_in() && pump_out()) 永不完成 → 死锁.
+                try {
+                    co_await handle_frame(fc);
+                } catch (const std::exception& e) {
+                    if (!abort_) {
+                        abort_ = true;
+                    }
+                    break;
+                }
             }
 
+            // pump_in 退出时, 唤醒 pump_out 并关闭 socket, 确保 pump_out
+            // 不会在 async_wait 或 async_write 上永久阻塞.
+            // (&& 使用 wait_for_one_error, 仅在一方出错时取消另一方;
+            //  若 pump_in 正常返回 (如 abort_ 被设置) 则不会取消 pump_out,
+            //  导致 pump_out 永久阻塞在 out_notifier_.async_wait(), 进而
+            //  使 && 永不完成, 唤醒等待者的 post-pump 代码永不执行 → 死锁.)
+            out_notifier_.cancel();
+            {
+                boost::system::error_code ignored;
+                next_layer_.lowest_layer().close(ignored);
+            }
             co_return;
         }
 

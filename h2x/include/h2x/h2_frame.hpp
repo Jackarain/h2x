@@ -1137,11 +1137,10 @@ namespace h2x {
         push_promise_frame(uint8_t* data, size_t size, bool unpack = true)
             : frame_codec(data, size)
         {
-            if (type() != frame_type::PUSH_PROMISE) {
-                throw std::runtime_error("push_promise_frame: type must be PUSH_PROMISE");
-            }
-
             if (unpack) {
+                if (type() != frame_type::PUSH_PROMISE) {
+                    throw std::runtime_error("push_promise_frame: type must be PUSH_PROMISE");
+                }
                 unpack_payload();
             }
         }
@@ -1320,11 +1319,10 @@ namespace h2x {
         continuation_frame(uint8_t* data, size_t size, bool unpack = true)
             : frame_codec(data, size)
         {
-            if (type() != frame_type::CONTINUATION) {
-                throw std:: runtime_error("continuation_frame:  type must be CONTINUATION");
-            }
-
             if (unpack) {
+                if (type() != frame_type::CONTINUATION) {
+                    throw std:: runtime_error("continuation_frame:  type must be CONTINUATION");
+                }
                 unpack_payload();
             }
         }
@@ -1416,11 +1414,10 @@ namespace h2x {
         data_frame(uint8_t* data, size_t size, bool unpack = true)
             : frame_codec(data, size)
         {
-            if (type() != frame_type::DATA) {
-                throw std::runtime_error("data_frame:  type must be DATA");
-            }
-
             if (unpack) {
+                if (type() != frame_type::DATA) {
+                    throw std::runtime_error("data_frame:  type must be DATA");
+                }
                 unpack_payload();
             }
         }
@@ -1567,11 +1564,10 @@ namespace h2x {
         goaway_frame(uint8_t* data, size_t size, bool unpack = true)
             : frame_codec(data, size)
         {
-            if (type() != frame_type::GOAWAY) {
-                throw std::runtime_error("goaway_frame:  type must be GOAWAY");
-            }
-
             if (unpack) {
+                if (type() != frame_type::GOAWAY) {
+                    throw std::runtime_error("goaway_frame:  type must be GOAWAY");
+                }
                 unpack_payload();
             }
         }
@@ -1652,11 +1648,10 @@ namespace h2x {
         window_update_frame(uint8_t* data, size_t size, bool unpack = true)
             : frame_codec(data, size)
         {
-            if (type() != frame_type::WINDOW_UPDATE) {
-                throw std::runtime_error("window_update_frame: type must be WINDOW_UPDATE");
-            }
-
             if (unpack) {
+                if (type() != frame_type::WINDOW_UPDATE) {
+                    throw std::runtime_error("window_update_frame: type must be WINDOW_UPDATE");
+                }
                 unpack_payload();
             }
         }
@@ -1721,11 +1716,10 @@ namespace h2x {
         ping_frame(uint8_t* data, size_t size, bool unpack = true)
             : frame_codec(data, size)
         {
-            if (type() != frame_type::PING) {
-                throw std::runtime_error("ping_frame: type must be PING");
-            }
-
             if (unpack) {
+                if (type() != frame_type::PING) {
+                    throw std::runtime_error("ping_frame: type must be PING");
+                }
                 unpack_payload();
             }
         }
@@ -1794,11 +1788,10 @@ namespace h2x {
         rst_stream_frame(uint8_t* data, size_t size, bool unpack = true)
             : frame_codec(data, size)
         {
-            if (type() != frame_type::RST_STREAM) {
-                throw std::runtime_error("rst_stream_frame: type must be RST_STREAM");
-            }
-
             if (unpack) {
+                if (type() != frame_type::RST_STREAM) {
+                    throw std::runtime_error("rst_stream_frame: type must be RST_STREAM");
+                }
                 unpack_payload();
             }
         }
@@ -1846,11 +1839,10 @@ namespace h2x {
         priority_frame(uint8_t* data, size_t size, bool unpack = true)
             : frame_codec(data, size)
         {
-            if (type() != frame_type::PRIORITY) {
-                throw std::runtime_error("priority_frame: type must be PRIORITY");
-            }
-
             if (unpack) {
+                if (type() != frame_type::PRIORITY) {
+                    throw std::runtime_error("priority_frame: type must be PRIORITY");
+                }
                 unpack_payload();
             }
         }

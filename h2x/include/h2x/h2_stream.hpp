@@ -91,21 +91,10 @@ namespace h2x {
         {
             boost::system::error_code ec;
 
-            auto it = conn_.streams_.find(stream_id_);
-            if (it == conn_.streams_.end()) {
-                ec = make_error_code(errc::stream_not_found);
-                co_return ec;
-            }
+            auto* sd = find_stream(ec);
+            if (!sd) co_return ec;
 
-            auto& sd = it->second;
-
-            // 检查流状态：如果流已关闭或本地已关闭，拒绝写入 HEADERS.
-            if (sd.state == stream_state::closed ||
-                sd.state == stream_state::half_closed_local ||
-                sd.reset_received) {
-                ec = make_error_code(errc::stream_closed);
-                co_return ec;
-            }
+            if (!is_writable(*sd, ec)) co_return ec;
 
             // 构建 HEADERS 帧.
             auto data = std::vector<uint8_t>(conn_.settings_.max_frame_size + 9);
@@ -137,15 +126,7 @@ namespace h2x {
             conn_.write_frame_data(std::move(data));
 
             // 更新流状态.
-            if (sd.state == stream_state::idle) {
-                sd.state = stream_state::open;
-            }
-            if (end_stream) {
-                // open → half_closed_local; half_closed_remote → closed
-                sd.state = (sd.state == stream_state::half_closed_remote)
-                    ? stream_state::closed
-                    : stream_state::half_closed_local;
-            }
+            transition_local_end_stream(*sd, end_stream);
 
             co_return ec;
         }
@@ -163,21 +144,11 @@ namespace h2x {
         {
             boost::system::error_code ec;
 
-            auto it = conn_.streams_.find(stream_id_);
-            if (it == conn_.streams_.end()) {
-                ec = make_error_code(errc::stream_not_found);
-                co_return ec;
-            }
+            auto* sdp = find_stream(ec);
+            if (!sdp) co_return ec;
+            auto& sd = *sdp;
 
-            auto& sd = it->second;
-
-            // 检查流状态：如果流已关闭或本地已关闭（发送过 END_STREAM），拒绝写入.
-            if (sd.state == stream_state::closed ||
-                sd.state == stream_state::half_closed_local ||
-                sd.reset_received) {
-                ec = make_error_code(errc::stream_closed);
-                co_return ec;
-            }
+            if (!is_writable(sd, ec)) co_return ec;
 
             size_t offset = 0;
             size_t max_payload = std::min(conn_.peer_max_frame_size_,
@@ -186,11 +157,25 @@ namespace h2x {
             while (offset < size) {
                 // 检查流级和连接级远端窗口.
                 while ((sd.remote_window <= 0 || conn_.conn_remote_window_ <= 0) && !ec) {
+                    // 流已被重置或连接已中止，停止写入.
+                    if (sd.reset_received || conn_.abort_) {
+                        ec = make_error_code(errc::stream_closed);
+                        break;
+                    }
+
                     // 等待 WINDOW_UPDATE.
                     net::steady_timer timer(get_executor());
-                    timer.expires_after(std::chrono::milliseconds(100));
+                    timer.expires_at(net::steady_timer::time_point::max());
 
                     sd.write_waiter = [&timer]() { timer.cancel(); };
+
+                    // 注册 waiter 后、挂起前重检，关闭竞态窗口.
+                    if (sd.remote_window > 0 && conn_.conn_remote_window_ > 0
+                        || sd.reset_received || conn_.abort_) {
+                        sd.write_waiter = nullptr;
+                        break;
+                    }
+
                     co_await timer.async_wait(net_awaitable[ec]);
                     sd.write_waiter = nullptr;
 
@@ -230,9 +215,7 @@ namespace h2x {
                 offset += chunk;
 
                 if (is_last) {
-                    sd.state = (sd.state == stream_state::half_closed_remote)
-                        ? stream_state::closed
-                        : stream_state::half_closed_local;
+                    transition_local_end_stream(sd, true);
                 }
             }
 
@@ -258,27 +241,13 @@ namespace h2x {
         {
             boost::system::error_code ec;
 
-            auto it = conn_.streams_.find(stream_id_);
-            if (it == conn_.streams_.end()) {
-                ec = make_error_code(errc::stream_not_found);
-                co_return ec;
-            }
-
-            auto& sd = it->second;
+            auto* sdp = find_stream(ec);
+            if (!sdp) co_return ec;
+            auto& sd = *sdp;
 
             // 等待头部到达.
-            while (sd.headers.empty() && !sd.remote_end_stream && !sd.reset_received) {
-                net::steady_timer timer(get_executor());
-                timer.expires_after(std::chrono::milliseconds(100));
-
-                sd.read_waiter = [&timer]() { timer.cancel(); };
-                co_await timer.async_wait(net_awaitable[ec]);
-                sd.read_waiter = nullptr;
-
-                if (ec == net::error::operation_aborted) {
-                    ec.clear();
-                }
-            }
+            co_await wait_until(sd, sd.read_waiter,
+                [](auto& s) { return !s.headers.empty(); });
 
             if (sd.reset_received) {
                 ec = make_error_code(errc::stream_closed);
@@ -300,27 +269,13 @@ namespace h2x {
         {
             boost::system::error_code ec;
 
-            auto it = conn_.streams_.find(stream_id_);
-            if (it == conn_.streams_.end()) {
-                ec = make_error_code(errc::stream_not_found);
-                co_return ec;
-            }
-
-            auto& sd = it->second;
+            auto* sdp = find_stream(ec);
+            if (!sdp) co_return ec;
+            auto& sd = *sdp;
 
             // 等待数据到达或流结束.
-            while (sd.read_buffer.empty() && !sd.remote_end_stream && !sd.reset_received) {
-                net::steady_timer timer(get_executor());
-                timer.expires_after(std::chrono::milliseconds(100));
-
-                sd.read_waiter = [&timer]() { timer.cancel(); };
-                co_await timer.async_wait(net_awaitable[ec]);
-                sd.read_waiter = nullptr;
-
-                if (ec == net::error::operation_aborted) {
-                    ec.clear();
-                }
-            }
+            co_await wait_until(sd, sd.read_waiter,
+                [](auto& s) { return !s.read_buffer.empty(); });
 
             if (sd.reset_received) {
                 ec = make_error_code(errc::stream_closed);
@@ -372,6 +327,85 @@ namespace h2x {
         }
 
     private:
+        // 查找本流的状态数据，未找到时设置 ec 并返回 nullptr.
+        typename Connection::stream_state_data*
+        find_stream(boost::system::error_code& ec)
+        {
+            auto it = conn_.streams_.find(stream_id_);
+            if (it == conn_.streams_.end()) {
+                ec = make_error_code(errc::stream_not_found);
+                return nullptr;
+            }
+            return &it->second;
+        }
+
+        // 检查流是否可写（未关闭/未半关闭本地/未收到重置）.
+        bool is_writable(const typename Connection::stream_state_data& sd,
+                         boost::system::error_code& ec) const
+        {
+            if (sd.state == stream_state::closed ||
+                sd.state == stream_state::half_closed_local ||
+                sd.reset_received) {
+                ec = make_error_code(errc::stream_closed);
+                return false;
+            }
+            return true;
+        }
+
+        // 本端发送 END_STREAM 后的状态迁移.
+        void transition_local_end_stream(
+            typename Connection::stream_state_data& sd, bool end_stream)
+        {
+            if (sd.state == stream_state::idle) {
+                sd.state = stream_state::open;
+            }
+            if (end_stream) {
+                sd.state = (sd.state == stream_state::half_closed_remote)
+                    ? stream_state::closed
+                    : stream_state::half_closed_local;
+            }
+        }
+
+        // 等待条件满足或流结束/重置，返回是否应继续.
+        // pred 返回 true 表示条件满足可退出等待.
+        //
+        // 实现说明:
+        // - timer 设为永不自然超时 (time_point::max()), 仅靠 waiter_slot()
+        //   即 timer.cancel() 唤醒.
+        // - 注册 waiter 后、挂起前重检谓词, 关闭"注册到挂起之间"的竞态窗口.
+        // - 依赖连接侧在所有改变等待条件的路径 (DATA/HEADERS/WINDOW_UPDATE/
+        //   RST_STREAM/GOAWAY/close/pump 退出) 上调用 waiter() 通知等待者.
+        template <class Pred>
+        net::awaitable<bool> wait_until(
+            typename Connection::stream_state_data& sd,
+            std::function<void()>& waiter_slot,
+            Pred pred)
+        {
+            boost::system::error_code ec;
+            while (!pred(sd) && !sd.remote_end_stream && !sd.reset_received && !conn_.abort_) {
+                net::steady_timer timer(get_executor());
+                timer.expires_at(net::steady_timer::time_point::max());
+
+                waiter_slot = [&timer]() { timer.cancel(); };
+
+                // 注册 waiter 后、挂起前重检, 关闭竞态窗口:
+                // 此段为同步执行 (无 co_await), 同 strand 上 pump 无法插入,
+                // 故事件要么在此被捕获, 要么在挂起后被 waiter() 唤醒.
+                if (pred(sd) || sd.remote_end_stream || sd.reset_received) {
+                    waiter_slot = nullptr;
+                    break;
+                }
+
+                co_await timer.async_wait(net_awaitable[ec]);
+                waiter_slot = nullptr;
+
+                if (ec == net::error::operation_aborted) {
+                    ec.clear(); // 被 waiter_slot() 唤醒.
+                }
+            }
+            co_return true;
+        }
+
         Connection& conn_;
         uint32_t stream_id_ = 0;
     };
@@ -430,10 +464,29 @@ namespace h2x {
             }
 
             // 使用定时器等待，并通过 accept_waiter_ 接收通知.
+            // timer 永不自然超时, 仅靠 accept_waiter_() 即 cancel() 唤醒.
+            // 依赖连接侧在 HEADERS/GOAWAY/close/pump 退出时调用 accept_waiter_() 通知.
             net::steady_timer timer(get_executor());
-            timer.expires_after(std::chrono::milliseconds(100));
+            timer.expires_at(net::steady_timer::time_point::max());
 
             accept_waiter_ = [&timer]() { timer.cancel(); };
+
+            // 注册 waiter 后、挂起前重检, 关闭竞态窗口.
+            if (abort_) {
+                accept_waiter_ = nullptr;
+                break;
+            }
+            for (auto& [sid, sd] : streams_) {
+                if (sd.state == stream_state::idle &&
+                    sd.is_remote_initiated) {
+                    accept_waiter_ = nullptr;
+                    sd.state = stream_state::open;
+                    sd.is_remote_initiated = false;
+                    stream_type s(*this, sid);
+                    co_return s;
+                }
+            }
+
             co_await timer.async_wait(net_awaitable[ec]);
             accept_waiter_ = nullptr;
 
