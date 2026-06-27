@@ -1,8 +1,15 @@
-﻿cmake_minimum_required(VERSION 3.10)
+﻿cmake_minimum_required(VERSION 3.16)
 cmake_policy(SET CMP0091 NEW) # for CMAKE_MSVC_RUNTIME_LIBRARY
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW) # cmake_policy(SET CMP0077 NEW)
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
-project(h2x LANGUAGES CXX)
+project(h2x VERSION 0.1.0 LANGUAGES CXX)
+
+# 检测是否作为顶层项目构建（直接构建 vs FetchContent/add_subdirectory）
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    set(H2X_IS_TOP_LEVEL TRUE)
+else()
+    set(H2X_IS_TOP_LEVEL FALSE)
+endif()
 
 ################################################################################
 
@@ -441,20 +448,82 @@ if (WIN32)
 endif()
 
 ################################################################################
-# 添加 example 项目
+# 添加 h2x 库
 
 add_subdirectory(h2x)
-add_subdirectory(example)
 
-# 添加 tests 项目
+# 当作为顶层项目构建时，添加 example / tests / fuzz 子目录；
+# 通过 FetchContent/add_subdirectory 使用时跳过这些。
+if(H2X_IS_TOP_LEVEL)
+	add_subdirectory(example)
 
-if(ENABLE_BUILD_TESTS)
-	enable_testing()
-	add_subdirectory(tests)
+	# 添加 tests 项目
+
+	if(ENABLE_BUILD_TESTS)
+		enable_testing()
+		add_subdirectory(tests)
+	endif()
+
+	# 添加 fuzz 项目
+
+	if(ENABLE_BUILD_FUZZ)
+		add_subdirectory(fuzz)
+	endif()
 endif()
 
-# 添加 fuzz 项目
+################################################################################
+# 安装规则 & CMake 包导出（支持 find_package / FetchContent）
 
-if(ENABLE_BUILD_FUZZ)
-	add_subdirectory(fuzz)
+include(CMakePackageConfigHelpers)
+include(GNUInstallDirs)
+
+# 安装 h2x 头文件
+install(
+    DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/h2x/include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.hpp"
+)
+
+# 安装 h2x 目标
+install(
+    TARGETS h2x
+    EXPORT h2xTargets
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+# 安装目标的 CMake 导出文件
+install(
+    EXPORT h2xTargets
+    FILE h2xTargets.cmake
+    NAMESPACE h2x::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/h2x
+)
+
+# 配置并安装 h2xConfig.cmake
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/h2xConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/cmake/h2xConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/h2x
+    PATH_VARS CMAKE_INSTALL_INCLUDEDIR
+)
+
+# 配置并安装 h2xConfigVersion.cmake
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/cmake/h2xConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY AnyNewerVersion
+)
+
+install(
+    FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/cmake/h2xConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/cmake/h2xConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/h2x
+)
+
+message(STATUS "h2x version: ${PROJECT_VERSION}")
+if(H2X_IS_TOP_LEVEL)
+    message(STATUS "h2x is top-level project")
+else()
+    message(STATUS "h2x is used as a subproject (FetchContent/add_subdirectory)")
 endif()
