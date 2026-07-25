@@ -61,6 +61,7 @@ option(ENABLE_USE_IO_URING			"Enable auto use io_uring" OFF)
 
 option(ENABLE_BUILD_TESTS			"Build unit tests with Boost.Test" OFF)
 option(ENABLE_BUILD_FUZZ			"Build fuzz targets (requires clang + libFuzzer)" OFF)
+option(ENABLE_BUILD_ASAN			"Build with ASAN" OFF)
 option(ENABLE_BUILD_WITH_LIBCXX		"Build with libc++" OFF)
 
 option(ENABLE_MOLD					"Build using mold" OFF)
@@ -83,6 +84,14 @@ option(ENABLE_REUSEPORT				"Enable SO_REUSEPORT socket option" OFF)
 
 find_program(MOLD_LINKER mold)
 find_program(LLD_LINKER lld)
+
+################################################################################
+
+# Address Sanitizer (only meaningful on unix like system).
+if (ENABLE_BUILD_ASAN AND UNIX)
+	add_compile_options(-g -O2 -fsanitize=address,undefined -fno-sanitize-recover=undefined)
+	add_link_options(-fsanitize=address,undefined)
+endif()
 
 ################################################################################
 
