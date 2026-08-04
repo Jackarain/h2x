@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <map>
 #include <exception>
+#include <stdexcept>
 #include <string>
 #include <span>
 #include <utility>
