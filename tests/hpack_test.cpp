@@ -535,4 +535,80 @@ BOOST_AUTO_TEST_CASE(dynamic_table_size_update)
 
 BOOST_AUTO_TEST_SUITE_END()
 
+// ──────────────────────────────────────────────────────────────────────────────
+// 编码修复回归测试 (代码审查 #4/#5/#6)
+// ──────────────────────────────────────────────────────────────────────────────
+
+BOOST_AUTO_TEST_SUITE(hpack_encode_fixes)
+
+BOOST_AUTO_TEST_CASE(pack_integer_multi_byte_first_byte)
+{
+    // #4: 多字节整数首字节不得保留 value 高位, 否则调用方 OR 入 opcode 后被污染.
+    // 值 128 ≥ 2^6-1, 触发 6-bit 前缀的多字节编码.
+    auto packed = hpack_pack_integer(128, 6);
+    BOOST_REQUIRE_GE(packed.size(), 2);
+    BOOST_CHECK_EQUAL(packed[0], 0x3F); // 低 6 位全 1, 高位为 0
+
+    // 模拟调用方 OR 入 0x40 (LITERAL_INCREMENTAL_INDEXING) 后应仍为合法前缀.
+    uint8_t first = static_cast<uint8_t>(0x40 | packed[0]);
+    BOOST_CHECK_EQUAL(first, 0x7F);
+
+    // 与解码端 roundtrip: 63 + 65 = 128.
+    uint64_t decoded = 0;
+    int ret = hpack_unpack_integer({packed.data(), packed.size()}, 6, decoded);
+    BOOST_CHECK_EQUAL(ret, static_cast<int>(packed.size()));
+    BOOST_CHECK_EQUAL(decoded, 128);
+}
+
+BOOST_AUTO_TEST_CASE(dynamic_table_hit_indexed_roundtrip)
+{
+    // #5: 动态表命中时, 复制出的 entry 需带正确组合表索引 (62+pos),
+    // 否则打包输出非法 HPACK (0x80 + 字面量).
+    std::vector<header_entry> dyn_table;
+    std::unordered_map<uint32_t, int> dyn_map;
+
+    const std::string name = "x-dynamic";
+    const std::string value = "value-dyn";
+    uint32_t hash = frame_header_hash({0, name, value, 0, nullptr});
+
+    // 模拟一条已在动态表中的条目 (index_ 恒为 0).
+    header_entry e{0, name, value, hash, &G_LITERAL_INCREMENTAL_INDEXING};
+    dyn_table.insert(dyn_table.begin(), e);
+    dyn_map[hash] = 0;
+
+    uint8_t buf[256] = {0};
+    headers_frame hf(buf, sizeof(buf), false, &dyn_table);
+    hf.end_headers_ = true;
+    hf.stream_id(1);
+    hf.add_header(name, value, &dyn_map, &dyn_table);
+
+    int total = hf.pack_headers();
+    BOOST_CHECK_GT(total, 9);
+
+    // 打包出的第一条应是指定动态表索引 62 的 INDEXED 字段: 0x80 | 62 = 0xBE.
+    BOOST_CHECK_EQUAL(buf[9], 0xBE);
+
+    // 用同一动态表解码回来.
+    headers_frame hf2(buf, sizeof(buf), true, &dyn_table);
+    BOOST_REQUIRE_GE(hf2.headers_.size(), 1);
+    BOOST_CHECK_EQUAL(hf2.headers_[0].name_.value_or(""), name);
+    BOOST_CHECK_EQUAL(hf2.headers_[0].value_.value_or(""), value);
+}
+
+BOOST_AUTO_TEST_CASE(pack_headers_overflow_returns_error)
+{
+    // #6: 头部放不下时应整体失败, 而非静默跳过导致块被截断.
+    uint8_t buf[32] = {0};
+    headers_frame hf(buf, sizeof(buf), false);
+    hf.end_headers_ = true;
+    hf.stream_id(1);
+    hf.add_header("x-long-header",
+        "a-value-that-is-far-too-long-to-fit-in-the-32-byte-buffer");
+
+    int total = hf.pack_headers();
+    BOOST_CHECK_LT(total, 0);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
 } // namespace h2x
