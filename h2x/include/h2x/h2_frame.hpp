@@ -391,6 +391,10 @@ namespace h2x {
         uint32_t index,
         const std::vector<header_entry>* dynamic_table = nullptr)
     {
+        // index 从 1 开始; 0 会导致静态表越界读 (table[-1]), 必须拒绝.
+        if (index == 0)
+            return nullptr;
+
         if (index <= 61)
             return &global_static_header_table[index - 1];
 
@@ -999,6 +1003,12 @@ namespace h2x {
                 throw std::runtime_error("headers_frame: invalid index");
             }
 
+            // 索引值超过 2^31-1 会被 static_cast<uint32_t> 截断为错误的小值
+            // (如 2^32 → 0), 触发错误的表项解析, 必须在此显式拒绝 (RFC 7540 §4.3.1).
+            if (index > 0x7FFFFFFF) {
+                throw std::runtime_error("headers_frame: index out of range");
+            }
+
             auto frame = hpack_index_to_frame(static_cast<uint32_t>(index), dynamic_table_);
             if (!frame) {
                 throw std::runtime_error("headers_frame: index out of range");
@@ -1054,6 +1064,11 @@ namespace h2x {
                 int ret = hpack_unpack_integer({payload, size}, op->nbits_, index);
                 if (ret < 0) {
                     throw std::runtime_error("headers_frame: invalid integer");
+                }
+
+                // 同 unpack_indexed: 拒绝 2^31-1 以上的索引, 防止截断后错误解析.
+                if (index > 0x7FFFFFFF) {
+                    throw std::runtime_error("headers_frame: index out of range");
                 }
 
                 auto frame = hpack_index_to_frame(static_cast<uint32_t>(index), dynamic_table_);
