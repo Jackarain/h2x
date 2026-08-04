@@ -241,7 +241,6 @@ namespace h2x {
 
         size_t encoded_size = encoded.size();
         uint64_t shift = 1;
-        uint64_t fexp = 0;
         int idx = 1;
 
         do {
@@ -250,7 +249,11 @@ namespace h2x {
             }
 
             byte = encoded[idx++];
-            if (fexp > 64) {
+
+            // 防止 (byte & 0x7F) * shift 溢出 uint64。
+            // 旧的 fexp > 64 检查在 shift 已达 2^63 时才触发，为时已晚；
+            // 必须在乘法前判断 shift 是否还能安全左移 7 位。
+            if (shift > (std::numeric_limits<uint64_t>::max() >> 7)) {
                 return -1;
             }
             uint64_t add = (byte & 0x7F) * shift;
@@ -262,7 +265,6 @@ namespace h2x {
             result += add; // 累加余数.
 
             shift <<= 7;
-            fexp += 7;
         } while (byte & 128);
 
         return idx;
