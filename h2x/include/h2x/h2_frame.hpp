@@ -473,17 +473,22 @@ namespace h2x {
      * 使用外部提供的缓冲区进行帧头与负载的读写，不管理缓冲区生命周期。
      */
     struct frame_codec {
-        frame_codec(uint8_t* data, size_t size)
+        // validate=false 时跳过 payload_size 校验, 供 pump_in 在读取帧头前
+        // 构造 frame_codec 使用 (此时缓冲区尚未填充帧头, 校验只会读到未初始化数据);
+        // 帧头读取后的实际校验由 async_read_frame 完成.
+        frame_codec(uint8_t* data, size_t size, bool validate = true)
             : data_(data), size_(size)
         {
             if (size_ < 9) {
                 throw std::runtime_error("frame_codec: size must be at least 9");
             }
-            // 校验 payload_size 不超出实际缓冲区边界，防止后续所有派生帧解析器
-            // (data_frame / headers_frame / settings_frame 等) 发生越界读。
-            auto plen = payload_size();
-            if (plen > size_ - 9) {
-                throw std::runtime_error("frame_codec: payload size exceeds buffer");
+            if (validate) {
+                // 校验 payload_size 不超出实际缓冲区边界，防止后续所有派生帧解析器
+                // (data_frame / headers_frame / settings_frame 等) 发生越界读。
+                auto plen = payload_size();
+                if (plen > size_ - 9) {
+                    throw std::runtime_error("frame_codec: payload size exceeds buffer");
+                }
             }
         }
 

@@ -298,7 +298,8 @@ namespace h2x {
                 settings_ = s;
 
                 // 初始化 pump 缓冲区（持久分配，避免每帧分配）.
-                pump_buf_.reset(new uint8_t[settings_.max_frame_size + 9]);
+                // 值初始化 (()) 防止帧头读入前被误读时读到未初始化数据.
+                pump_buf_.reset(new uint8_t[settings_.max_frame_size + 9]());
 
                 // 在后台启动输入/输出 pump 协程，async_handshake 将正常返回.
                 auto exit_flag = pump_done_;
@@ -1111,27 +1112,31 @@ namespace h2x {
             boost::system::error_code ec;
 
             while (!abort_) {
-                // 使用持久分配缓冲区，避免每次迭代重复分配.
-                frame_codec fc(pump_buf_.get(), settings_.max_frame_size + 9);
-
-                // 异步读取帧.
-                co_await async_read_frame(fc, ec);
-                if (ec) {
-                    if (!abort_) {
-                        abort_ = true;
-                    }
-                    break;
-                }
-
-                // 分派帧处理.
-                // 使用 try/catch 防止 handle_frame (或其调用的
-                // send_control_frame / pack_payload 等) 抛出异常时,
-                // pump_in 直接退出而跳过下方的清理逻辑, 导致 pump_out
-                // 永久阻塞在 out_notifier_.async_wait() 上, 进而使
-                // (pump_in() && pump_out()) 永不完成 → 死锁.
                 try {
+                    // 使用持久分配缓冲区，避免每次迭代重复分配.
+                    // 注意: 此时帧头尚未读入缓冲区, frame_codec 构造时
+                    // 不能做 payload_size 校验 (会读到未初始化数据), 故传 validate=false;
+                    // 真正的帧长校验由 async_read_frame 读入 9 字节帧头后执行.
+                    frame_codec fc(pump_buf_.get(),
+                        settings_.max_frame_size + 9, false);
+
+                    // 异步读取帧.
+                    co_await async_read_frame(fc, ec);
+                    if (ec) {
+                        if (!abort_) {
+                            abort_ = true;
+                        }
+                        break;
+                    }
+
+                    // 分派帧处理.
                     co_await handle_frame(fc);
                 } catch (const std::exception& e) {
+                    // 防止 handle_frame (或其调用的 send_control_frame /
+                    // pack_payload 等) 抛出异常时, pump_in 直接退出而跳过
+                    // 下方的清理逻辑, 导致 pump_out 永久阻塞在
+                    // out_notifier_.async_wait() 上, 进而使
+                    // (pump_in() && pump_out()) 永不完成 → 死锁.
                     if (!abort_) {
                         abort_ = true;
                     }
