@@ -132,9 +132,10 @@ namespace h2x {
      * @param input 待编码的字节序列视图。
      * @return 编码后所需的字节数（向上取整到字节）。
      */
-    static int huffman_encode_size(std::span<const uint8_t> input)
+    static size_t huffman_encode_size(std::span<const uint8_t> input)
     {
-        int count = 0;
+        // 用 size_t 累加, 避免大输入 (>~71MB) 时 int 溢出回绕成错误大小.
+        size_t count = 0;
 
         // 统计字符串中每个字符的编码长度.
         for (auto& ch : input) {
@@ -831,7 +832,8 @@ namespace h2x {
 
         uint8_t compute_flags() const
         {
-            uint8_t flag = flags();
+            // 从 0 开始构建, 避免复用缓冲区时残留的 flags 位被带入输出帧.
+            uint8_t flag = 0;
 
             if (end_stream_)  flag |= (uint8_t)frame_flag::END_STREAM;
             if (end_headers_) flag |= (uint8_t)frame_flag::END_HEADERS;

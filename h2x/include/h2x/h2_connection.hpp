@@ -132,31 +132,11 @@ namespace h2x {
             , dynamic_table_map_(global_static_header_table_map)
         {}
 
-        connection(connection&& other)
-            : next_layer_(std::move(other.next_layer_))
-            , out_notifier_(std::move(other.out_notifier_))
-            , strand_(std::move(other.strand_))
-            , settings_(std::move(other.settings_))
-            , dynamic_table_map_(std::move(other.dynamic_table_map_))
-            , dynamic_table_(std::move(other.dynamic_table_))
-            , streams_(std::move(other.streams_))
-            , pump_buf_(std::move(other.pump_buf_))
-        {}
-
-        connection& operator=(connection&& other)
-        {
-            if (this != &other) {
-                next_layer_ = static_cast<NextLayer&&>(other.next_layer_);
-                out_notifier_ = std::move(other.out_notifier_);
-                strand_ = std::move(other.strand_);
-                settings_ = std::move(other.settings_);
-                dynamic_table_map_ = std::move(other.dynamic_table_map_);
-                dynamic_table_ = std::move(other.dynamic_table_);
-                streams_ = std::move(other.streams_);
-                pump_buf_ = std::move(other.pump_buf_);
-            }
-            return *this;
-        }
+        // 禁止移动: 连接一旦开始异步运行 (pump 协程捕获内部状态, 可能已有
+        // stream 持有其引用), 移动会遗漏窗口/流 ID/pump 退出标志等成员, 导致
+        // async_wait_pump 挂起或 use-after-free. 请使用 shared_ptr 管理.
+        connection(connection&&) = delete;
+        connection& operator=(connection&&) = delete;
 
         ~connection() = default;
 
@@ -1008,8 +988,10 @@ namespace h2x {
             last_stream_id_ = gf.get_last_stream_id();
             abort_ = true;
 
-            // GOAWAY 影响所有流: 唤醒所有等待者, 使其即时退出.
+            // GOAWAY 影响所有流: 先标记为已重置再唤醒等待者,
+            // 使读取者返回 stream_closed 而非干净的 EOF.
             for (auto& [id, sd] : streams_) {
+                sd.reset_received = true;
                 if (sd.read_waiter) { sd.read_waiter(); sd.read_waiter = nullptr; }
                 if (sd.write_waiter) { sd.write_waiter(); sd.write_waiter = nullptr; }
             }
