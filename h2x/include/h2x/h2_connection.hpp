@@ -871,6 +871,13 @@ namespace h2x {
                 }
             } else {
                 // 头部块有后续 CONTINUATION 帧 — 暂存原始 payload.
+                // 上一个头部块尚未以 CONTINUATION 结束又收到新的 HEADERS → 协议错误.
+                if (sd.headers_in_progress) {
+                    co_await send_goaway(sid, http2_error_code::PROTOCOL_ERROR);
+                    abort_ = true;
+                    co_return;
+                }
+                sd.headers_in_progress = true;
                 sd.pending_end_stream = hf.end_stream_;
                 auto payload = fc.payload();
                 auto plen = fc.payload_size();
@@ -1071,13 +1078,28 @@ namespace h2x {
 
             auto& sd = it->second;
 
-            // 累积本次 CONTINUATION 的头部块片段.
+            // 没有在途的 HEADERS (END_HEADERS 未置位) 就收到 CONTINUATION → 协议错误.
+            if (!sd.headers_in_progress) {
+                co_await send_goaway(sid, http2_error_code::PROTOCOL_ERROR);
+                abort_ = true;
+                co_return;
+            }
+
+            // 累积本次 CONTINUATION 的头部块片段, 并设置大小上限防止内存耗尽.
             auto& frag = cf.get_header_block_fragment();
+            size_t limit = settings_.max_header_list_size > 0
+                ? settings_.max_header_list_size
+                : (16 * 1024 * 1024);
+            if (sd.pending_header_block.size() + frag.size() > limit) {
+                co_await send_goaway(sid, http2_error_code::ENHANCE_YOUR_CALM);
+                abort_ = true;
+                co_return;
+            }
             sd.pending_header_block.insert(
                 sd.pending_header_block.end(),
                 frag.begin(), frag.end());
 
-            if (cf.is_end_headers() && !sd.pending_header_block.empty()) {
+            if (cf.is_end_headers()) {
                 // 最后一块到达 — 构造合成 HEADERS 帧来解析完整头部块.
                 auto total = sd.pending_header_block.size();
                 std::vector<uint8_t> tmp(total + 9);
@@ -1135,6 +1157,7 @@ namespace h2x {
                 }
 
                 sd.pending_header_block.clear();
+                sd.headers_in_progress = false;
 
                 // 尝试释放已终止且数据已消费完的流.
                 maybe_release_stream(sid);
@@ -1377,6 +1400,7 @@ namespace h2x {
             bool remote_end_stream = false;
             bool reset_received = false;
             bool pending_end_stream = false;  // 暂存分片 HEADERS 的 END_STREAM 标志.
+            bool headers_in_progress = false; // 分片 HEADERS (END_HEADERS 未置位) 是否在途.
 
             // 流控窗口.
             int64_t local_window = 65535;
