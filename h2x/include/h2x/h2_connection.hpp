@@ -20,6 +20,7 @@
 #include <functional>
 #include <atomic>
 #include <optional>
+#include <memory>
 
 #include <boost/asio/strand.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -108,6 +109,7 @@ namespace h2x {
      */
     template <class NextLayer>
     class connection
+        : public std::enable_shared_from_this<connection<NextLayer>>
     {
     public:
         using next_layer_type = std::remove_reference_t<NextLayer>;
@@ -302,20 +304,24 @@ namespace h2x {
                 pump_buf_.reset(new uint8_t[settings_.max_frame_size + 9]());
 
                 // 在后台启动输入/输出 pump 协程，async_handshake 将正常返回.
+                // 捕获 self (shared_from_this) 保持连接存活, 防止调用方在
+                // pump 退出前释放连接导致 use-after-free.
+                // 注意: connection 需由 shared_ptr 管理 (见 README 示例).
+                auto self = this->shared_from_this();
                 auto exit_flag = pump_done_;
                 net::co_spawn(strand_,
-                    [this, exit_flag]() -> net::awaitable<void> {
+                    [self, exit_flag]() -> net::awaitable<void> {
                         using namespace net::experimental::awaitable_operators;
-                        co_await (pump_in() && pump_out());
+                        co_await (self->pump_in() && self->pump_out());
                         *exit_flag = true;
                         // pump 退出后, 标记所有流为已重置并唤醒等待者,
                         // 确保任何阻塞在 wait_until 的协程能被唤醒并退出.
-                        for (auto& [id, sd] : streams_) {
+                        for (auto& [id, sd] : self->streams_) {
                             sd.reset_received = true;
                             if (sd.read_waiter) { sd.read_waiter(); sd.read_waiter = nullptr; }
                             if (sd.write_waiter) { sd.write_waiter(); sd.write_waiter = nullptr; }
                         }
-                        if (accept_waiter_) { accept_waiter_(); accept_waiter_ = nullptr; }
+                        if (self->accept_waiter_) { self->accept_waiter_(); self->accept_waiter_ = nullptr; }
                     },
                     net::detached);
 
@@ -401,6 +407,8 @@ namespace h2x {
         const settings& get_settings() const noexcept { return settings_; }
         /** @brief 返回本端角色（client/server）。 */
         role get_role() const noexcept { return role_; }
+        /** @brief 当前连接中仍被跟踪的流数量（含已关闭但未释放的）。 */
+        std::size_t stream_count() const noexcept { return streams_.size(); }
 
         ////////////////////////////////////////////////////////////////////////////////
 
@@ -551,6 +559,34 @@ namespace h2x {
             return id;
         }
 
+        // 流进入终止态且应用已消费完数据、无等待者时, 将其从流表移除,
+        // 防止长连接/服务端上已关闭的流无限累积导致内存持续增长.
+        // 终止判定: 远端已结束 (END_STREAM 或 RST) 且本端也已结束
+        // (state 为 closed, 或 state 为 half_closed_local).
+        // 注意: 远端 END_STREAM 在流仍为 idle 时只置 remote_end_stream,
+        // 不迁移 state, 故不能用 state == closed 作为唯一条件.
+        void maybe_release_stream(uint32_t sid)
+        {
+            auto it = streams_.find(sid);
+            if (it == streams_.end())
+                return;
+
+            auto& sd = it->second;
+            const bool remote_ended =
+                sd.remote_end_stream || sd.reset_received;
+            const bool local_ended =
+                sd.state == stream_state::closed ||
+                sd.state == stream_state::half_closed_local;
+            if (remote_ended && local_ended &&
+                sd.read_buffer.empty() &&
+                sd.headers.empty() &&
+                sd.pending_header_block.empty() &&
+                !sd.read_waiter &&
+                !sd.write_waiter) {
+                streams_.erase(it);
+            }
+        }
+
         // 处理接收到的各个类型帧.
         net::awaitable<void> handle_frame(frame_codec& fc)
         {
@@ -663,6 +699,9 @@ namespace h2x {
                 sd.remote_end_stream = true;
             }
 
+            // 尝试释放已终止且数据已消费完的流.
+            maybe_release_stream(sid);
+
             co_return;
         }
 
@@ -680,6 +719,20 @@ namespace h2x {
                     (role_ == role::client && sid % 2 == 1 && sid != 0)) {
                     // 违反 HTTP/2 协议，发送 GOAWAY PROTOCOL_ERROR
                     co_await send_goaway(sid, http2_error_code::PROTOCOL_ERROR);
+                    co_return;
+                }
+
+                // 并发流上限: 超过本端声明的 SETTINGS_MAX_CONCURRENT_STREAMS
+                // 时拒绝新流 (RFC 7540 §5.1.2), 防止对端开无限流耗尽内存.
+                size_t active = 0;
+                for (auto& [id, sd] : streams_) {
+                    if (sd.is_remote_initiated &&
+                        sd.state != stream_state::closed) {
+                        ++active;
+                    }
+                }
+                if (active >= settings_.max_concurrent_streams) {
+                    co_await send_rst_stream(sid, http2_error_code::REFUSED_STREAM);
                     co_return;
                 }
 
@@ -736,6 +789,9 @@ namespace h2x {
                     sd.read_waiter();
                     sd.read_waiter = nullptr;
                 }
+
+                // 先唤醒等待者, 再尝试释放终止的流 (避免释放后悬垂引用).
+                maybe_release_stream(sid);
 
                 // 通知 async_accept 有新流到达.
                 if (accept_waiter_) {
@@ -805,6 +861,9 @@ namespace h2x {
                     it->second.write_waiter();
                     it->second.write_waiter = nullptr;
                 }
+
+                // 重置流的缓冲数据已不可读, 唤醒等待者后直接移除, 防止累积.
+                streams_.erase(it);
             }
             co_return;
         }
@@ -983,6 +1042,9 @@ namespace h2x {
                 }
 
                 sd.pending_header_block.clear();
+
+                // 尝试释放已终止且数据已消费完的流.
+                maybe_release_stream(sid);
             }
 
             co_return;

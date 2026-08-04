@@ -35,8 +35,10 @@ namespace h2x {
     public:
         using executor_type = typename Connection::executor_type;
 
-        stream(Connection& conn, uint32_t stream_id)
-            : conn_(conn)
+        // 以 shared_ptr 持有连接: 只要流对象仍存在, 底层 connection 就不会被
+        // 销毁, 避免流协程运行期间连接先一步析构导致 use-after-free.
+        stream(std::shared_ptr<Connection> conn, uint32_t stream_id)
+            : conn_(std::move(conn))
             , stream_id_(stream_id)
         {}
 
@@ -68,7 +70,7 @@ namespace h2x {
 
         executor_type get_executor() noexcept
         {
-            return conn_.get_executor();
+            return conn_->get_executor();
         }
 
         /**
@@ -97,7 +99,7 @@ namespace h2x {
             if (!is_writable(*sd, ec)) co_return ec;
 
             // 构建 HEADERS 帧.
-            auto data = std::vector<uint8_t>(conn_.settings_.max_frame_size + 9);
+            auto data = std::vector<uint8_t>(conn_->settings_.max_frame_size + 9);
             headers_frame hf(data.data(), data.size(), false);
             hf.stream_id(stream_id_);
             hf.end_stream_ = end_stream;
@@ -105,7 +107,7 @@ namespace h2x {
 
             for (auto& [name, value] : headers) {
                 hf.add_header(name, value,
-                    &conn_.dynamic_table_map_, &conn_.dynamic_table_);
+                    &conn_->dynamic_table_map_, &conn_->dynamic_table_);
             }
 
             int total = hf.pack_headers();
@@ -117,16 +119,19 @@ namespace h2x {
             // 将 LITERAL_INCREMENTAL_INDEXING 条目加入动态表.
             for (auto& entry : hf.headers_) {
                 if (entry.type_ == &G_LITERAL_INCREMENTAL_INDEXING) {
-                    conn_.add_to_dynamic_table(entry);
+                    conn_->add_to_dynamic_table(entry);
                 }
             }
 
             // 发送帧.
             data.resize(total);
-            conn_.write_frame_data(std::move(data));
+            conn_->write_frame_data(std::move(data));
 
             // 更新流状态.
             transition_local_end_stream(*sd, end_stream);
+
+            // 本端已半关闭, 若流数据已消费完则尝试释放.
+            conn_->maybe_release_stream(stream_id_);
 
             co_return ec;
         }
@@ -151,14 +156,14 @@ namespace h2x {
             if (!is_writable(sd, ec)) co_return ec;
 
             size_t offset = 0;
-            size_t max_payload = std::min(conn_.peer_max_frame_size_,
-                                          conn_.settings_.max_frame_size);
+            size_t max_payload = std::min(conn_->peer_max_frame_size_,
+                                          conn_->settings_.max_frame_size);
 
             while (offset < size) {
                 // 检查流级和连接级远端窗口.
-                while ((sd.remote_window <= 0 || conn_.conn_remote_window_ <= 0) && !ec) {
+                while ((sd.remote_window <= 0 || conn_->conn_remote_window_ <= 0) && !ec) {
                     // 流已被重置或连接已中止，停止写入.
-                    if (sd.reset_received || conn_.abort_) {
+                    if (sd.reset_received || conn_->abort_) {
                         ec = make_error_code(errc::stream_closed);
                         break;
                     }
@@ -170,8 +175,8 @@ namespace h2x {
                     sd.write_waiter = [&timer]() { timer.cancel(); };
 
                     // 注册 waiter 后、挂起前重检，关闭竞态窗口.
-                    if (sd.remote_window > 0 && conn_.conn_remote_window_ > 0
-                        || sd.reset_received || conn_.abort_) {
+                    if (sd.remote_window > 0 && conn_->conn_remote_window_ > 0
+                        || sd.reset_received || conn_->abort_) {
                         sd.write_waiter = nullptr;
                         break;
                     }
@@ -189,7 +194,7 @@ namespace h2x {
                 // 计算本次发送大小（受流级和连接级窗口共同限制）.
                 size_t chunk = std::min(size - offset, max_payload);
                 chunk = std::min(chunk, static_cast<size_t>(sd.remote_window));
-                chunk = std::min(chunk, static_cast<size_t>(conn_.conn_remote_window_));
+                chunk = std::min(chunk, static_cast<size_t>(conn_->conn_remote_window_));
 
                 // 构建 DATA 帧.
                 size_t buf_size = chunk + 9 + 1; // +1 for possible padding
@@ -207,17 +212,21 @@ namespace h2x {
 
                 size_t frame_len = df.frame_size();
                 frame_data.resize(frame_len);
-                conn_.write_frame_data(std::move(frame_data));
+                conn_->write_frame_data(std::move(frame_data));
 
                 // 更新远端窗口（流级和连接级）.
                 sd.remote_window -= chunk;
-                conn_.conn_remote_window_ -= chunk;
+                conn_->conn_remote_window_ -= chunk;
                 offset += chunk;
 
                 if (is_last) {
                     transition_local_end_stream(sd, true);
                 }
             }
+
+            // 本端已半关闭, 若流数据已消费完则尝试释放 (必须在循环外,
+            // 避免释放后 sd 悬垂).
+            conn_->maybe_release_stream(stream_id_);
 
             co_return ec;
         }
@@ -256,6 +265,10 @@ namespace h2x {
 
             auto result = std::move(sd.headers);
             sd.headers.clear();
+
+            // 头部已消费, 若流已终止则尝试释放, 防止流对象累积.
+            conn_->maybe_release_stream(stream_id_);
+
             co_return result;
         }
 
@@ -286,6 +299,10 @@ namespace h2x {
             if (!sd.read_buffer.empty()) {
                 auto result = std::move(sd.read_buffer);
                 sd.read_buffer.clear();
+
+                // 数据已消费, 若流已终止则尝试释放, 防止流对象累积.
+                conn_->maybe_release_stream(stream_id_);
+
                 co_return result;
             }
 
@@ -298,8 +315,8 @@ namespace h2x {
          */
         bool has_data() const
         {
-            auto it = conn_.streams_.find(stream_id_);
-            if (it == conn_.streams_.end()) return false;
+            auto it = conn_->streams_.find(stream_id_);
+            if (it == conn_->streams_.end()) return false;
             return !it->second.read_buffer.empty();
         }
 
@@ -308,8 +325,8 @@ namespace h2x {
          */
         bool is_done() const
         {
-            auto it = conn_.streams_.find(stream_id_);
-            if (it == conn_.streams_.end()) return true;
+            auto it = conn_->streams_.find(stream_id_);
+            if (it == conn_->streams_.end()) return true;
             auto& sd = it->second;
             return sd.state == stream_state::closed ||
                    sd.reset_received;
@@ -322,7 +339,7 @@ namespace h2x {
          */
         net::awaitable<void> cancel(http2_error_code code = http2_error_code::CANCEL)
         {
-            co_await conn_.send_rst_stream(stream_id_, code);
+            co_await conn_->send_rst_stream(stream_id_, code);
             co_return;
         }
 
@@ -331,8 +348,8 @@ namespace h2x {
         typename Connection::stream_state_data*
         find_stream(boost::system::error_code& ec)
         {
-            auto it = conn_.streams_.find(stream_id_);
-            if (it == conn_.streams_.end()) {
+            auto it = conn_->streams_.find(stream_id_);
+            if (it == conn_->streams_.end()) {
                 ec = make_error_code(errc::stream_not_found);
                 return nullptr;
             }
@@ -382,7 +399,7 @@ namespace h2x {
             Pred pred)
         {
             boost::system::error_code ec;
-            while (!pred(sd) && !sd.remote_end_stream && !sd.reset_received && !conn_.abort_) {
+            while (!pred(sd) && !sd.remote_end_stream && !sd.reset_received && !conn_->abort_) {
                 net::steady_timer timer(get_executor());
                 timer.expires_at(net::steady_timer::time_point::max());
 
@@ -406,7 +423,7 @@ namespace h2x {
             co_return true;
         }
 
-        Connection& conn_;
+        std::shared_ptr<Connection> conn_;
         uint32_t stream_id_ = 0;
     };
 
@@ -440,7 +457,7 @@ namespace h2x {
         sd.local_window = settings_.initial_window_size;
         sd.remote_window = peer_initial_window_size_;  // 使用对端协商的初始窗口值
 
-        stream_type s(*this, stream_id);
+        stream_type s(this->shared_from_this(), stream_id);
         co_return s;
     }
 
@@ -458,7 +475,7 @@ namespace h2x {
                     sd.is_remote_initiated) {
                     sd.state = stream_state::open;
                     sd.is_remote_initiated = false;
-                    stream_type s(*this, sid);
+                    stream_type s(this->shared_from_this(), sid);
                     co_return s;
                 }
             }
@@ -482,7 +499,7 @@ namespace h2x {
                     accept_waiter_ = nullptr;
                     sd.state = stream_state::open;
                     sd.is_remote_initiated = false;
-                    stream_type s(*this, sid);
+                    stream_type s(this->shared_from_this(), sid);
                     co_return s;
                 }
             }
