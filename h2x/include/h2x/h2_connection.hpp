@@ -262,22 +262,30 @@ namespace h2x {
                     co_return;
                 }
 
-                // 接收对方的连接设置帧.
-                co_await async_read_frame(sf, ec);
-                if (ec) {
-                    co_return;
-                }
-
-                // 检查帧类型，确保收到的是 SETTINGS 帧.
-                if (sf.type() != frame_type::SETTINGS) {
-                    ec = make_error_code(errc::protocol_error);
-                    co_return;
+                // 接收对方 SETTINGS. 握手期间可能收到其它帧 (如客户端在
+                // SETTINGS 后立即流水线化的请求 HEADERS), 一律派发到
+                // handle_frame 处理, 而不是吞掉丢弃.
+                bool got_settings = false;
+                while (!got_settings) {
+                    if (!co_await async_read_frame_timed(sf,
+                            std::chrono::seconds(30), ec)) {
+                        co_return;
+                    }
+                    if (sf.type() == frame_type::SETTINGS &&
+                        !(sf.flags() & static_cast<uint8_t>(frame_flag::FLAG_ACK))) {
+                        got_settings = true;
+                    } else {
+                        co_await handle_frame(sf);
+                    }
                 }
 
                 // 解析对方的连接设置帧, 更新本地配置.
                 sf.entries_.clear();
                 sf.unpack_settings();
-                apply_peer_settings(sf.entries_);
+                if (!apply_peer_settings(sf.entries_)) {
+                    ec = make_error_code(errc::flow_control_error);
+                    co_return;
+                }
 
                 // 发送连接设置帧 ACK.
                 sf.ack_ = true;
@@ -290,10 +298,20 @@ namespace h2x {
                     co_return;
                 }
 
-                // 接收对方的连接设置帧 ACK.
-                co_await async_read_frame(sf, ec);
-                if (ec) {
-                    co_return;
+                // 等待对方 ACK 我们的 SETTINGS. 期间其它帧照常派发,
+                // 并校验收到的确实是 SETTINGS ACK.
+                bool got_ack = false;
+                while (!got_ack) {
+                    if (!co_await async_read_frame_timed(sf,
+                            std::chrono::seconds(30), ec)) {
+                        co_return;
+                    }
+                    if (sf.type() == frame_type::SETTINGS &&
+                        (sf.flags() & static_cast<uint8_t>(frame_flag::FLAG_ACK))) {
+                        got_ack = true;
+                    } else {
+                        co_await handle_frame(sf);
+                    }
                 }
 
                 // 更新协商后的配置.
@@ -465,6 +483,33 @@ namespace h2x {
         }
 
         /**
+         * @brief 带超时读取一帧（用于握手，防止对端不响应时永久挂起）。
+         *
+         * 成功返回 true 并清空 ec；超时或读取失败返回 false 并置 ec。
+         */
+        net::awaitable<bool> async_read_frame_timed(frame_codec& fc,
+            std::chrono::milliseconds timeout, boost::system::error_code& ec)
+        {
+            using namespace net::experimental::awaitable_operators;
+            boost::system::error_code read_ec;
+            net::steady_timer timer(get_executor());
+            timer.expires_after(timeout);
+            co_await (async_read_frame(fc, read_ec) ||
+                      timer.async_wait(net_awaitable[ec]));
+            if (read_ec == net::error::operation_aborted) {
+                // 计时器先到期 → 握手超时.
+                ec = make_error_code(errc::protocol_error);
+                co_return false;
+            }
+            if (read_ec) {
+                ec = read_ec;
+                co_return false;
+            }
+            ec.clear();
+            co_return true;
+        }
+
+        /**
          * @brief 将已序列化的帧数据入队，等待 `pump_out` 将其写出。
          *
          * 线程安全（通过 strand 分发），供内部帧构建逻辑调用。
@@ -514,8 +559,9 @@ namespace h2x {
         }
 
     private:
-        // 从对端 SETTINGS 更新本地配置.
-        void apply_peer_settings(const std::vector<settings_entry>& entries)
+        // 从对端 SETTINGS 更新本地配置. 返回 false 表示流控窗口越界
+        // (RFC 7540 §6.5.2/§6.9.2 连接错误 FLOW_CONTROL_ERROR).
+        bool apply_peer_settings(const std::vector<settings_entry>& entries)
         {
             for (auto& e : entries) {
                 switch (static_cast<settings_id>(e.identifier_)) {
@@ -527,12 +573,24 @@ namespace h2x {
                     break;
                 case settings_id::SETTINGS_INITIAL_WINDOW_SIZE:
                 {
-                    int32_t delta = static_cast<int32_t>(e.value_)
-                                  - static_cast<int32_t>(peer_initial_window_size_);
+                    // 窗口值不得超过 2^31-1 (RFC 7540 §6.5.2).
+                    if (e.value_ > 0x7FFFFFFF)
+                        return false;
+
+                    int64_t delta = static_cast<int64_t>(e.value_)
+                                  - static_cast<int64_t>(peer_initial_window_size_);
                     peer_initial_window_size_ = e.value_;
-                    // 更新所有已存在流的远端窗口.
                     for (auto& [id, sd] : streams_) {
+                        // 调整后任一流的远端窗口不得超过 2^31-1 (RFC 7540 §6.9.2).
+                        if (sd.remote_window + delta > 0x7FFFFFFF)
+                            return false;
                         sd.remote_window += delta;
+                        // 窗口增大后必须唤醒等待发送的写入者; 否则发送协程
+                        // 即使窗口已恢复也会永久挂起.
+                        if (sd.write_waiter) {
+                            sd.write_waiter();
+                            sd.write_waiter = nullptr;
+                        }
                     }
                     break;
                 }
@@ -878,7 +936,12 @@ namespace h2x {
             }
 
             // 更新对端设置.
-            apply_peer_settings(sf.entries_);
+            if (!apply_peer_settings(sf.entries_)) {
+                // 流控窗口越界 → 连接错误.
+                co_await send_goaway(0, http2_error_code::FLOW_CONTROL_ERROR);
+                abort_ = true;
+                co_return;
+            }
 
             // 发送 SETTINGS ACK.
             sf.ack_ = true;
