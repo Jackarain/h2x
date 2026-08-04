@@ -601,19 +601,23 @@ namespace h2x {
                     break;
                 }
             }
+            return true;
         }
 
         // 分配流 ID：客户端使用奇数，服务端使用偶数.
+        // 流 ID 为 31 位; 超出 0x7FFFFFFF 时返回 0 表示空间耗尽 (RFC 7540 §5.1.1),
+        // 由 async_request 发起 GOAWAY.
         uint32_t allocate_stream_id()
         {
             uint32_t id = next_stream_id_;
             if (role_ == role::client) {
                 if (id % 2 == 0) id++; // 确保奇数
-                next_stream_id_ = id + 2;
             } else {
                 if (id % 2 == 1) id++; // 确保偶数
-                next_stream_id_ = id + 2;
             }
+            if (id > 0x7FFFFFFF)
+                return 0;
+            next_stream_id_ = id + 2;
             return id;
         }
 
@@ -695,6 +699,26 @@ namespace h2x {
         net::awaitable<void> handle_data_frame(frame_codec& fc)
         {
             auto sid = fc.stream_id();
+            data_frame df(fc.data_, fc.size_);
+            int64_t data_len = static_cast<int64_t>(df.get_data().size());
+
+            // 连接级窗口: 所有收到的 DATA 都消耗连接级窗口, 无论流是否
+            // 存在/已关闭/被重置. 否则被丢弃的 DATA 不入账, 对端连接窗口
+            // 会逐渐被本端少发的 WINDOW_UPDATE 透支而整条连接卡死.
+            if (data_len > conn_local_window_) {
+                // 连接级流控违规.
+                co_await send_goaway(0, http2_error_code::FLOW_CONTROL_ERROR);
+                abort_ = true;
+                co_return;
+            }
+            conn_local_window_ -= data_len;
+            if (conn_local_window_ < static_cast<int64_t>(settings_.initial_window_size / 2)) {
+                uint32_t increment = static_cast<uint32_t>(
+                    static_cast<int64_t>(settings_.initial_window_size) - conn_local_window_);
+                co_await send_window_update(0, increment);
+                conn_local_window_ = settings_.initial_window_size;
+            }
+
             auto it = streams_.find(sid);
             if (it == streams_.end()) {
                 // 流不存在，发送 RST_STREAM.
@@ -704,14 +728,12 @@ namespace h2x {
 
             auto& sd = it->second;
 
-            // 如果流已关闭或收到重置，忽略 DATA 帧.
+            // 如果流已关闭或收到重置，忽略 DATA 帧 (连接级窗口已入账).
             if (sd.state == stream_state::closed || sd.reset_received) {
                 co_return;
             }
-            data_frame df(fc.data_, fc.size_);
 
-            // 更新流控窗口.
-            int64_t data_len = static_cast<int64_t>(df.get_data().size());
+            // 流级窗口.
             if (data_len > sd.local_window) {
                 co_await send_rst_stream(sid, http2_error_code::FLOW_CONTROL_ERROR);
                 co_return;
@@ -724,15 +746,6 @@ namespace h2x {
                     static_cast<int64_t>(settings_.initial_window_size) - sd.local_window);
                 co_await send_window_update(sid, increment);
                 sd.local_window = settings_.initial_window_size;
-            }
-
-            // 检查是否需要更新连接级窗口.
-            conn_local_window_ -= data_len;
-            if (conn_local_window_ < static_cast<int64_t>(settings_.initial_window_size / 2)) {
-                uint32_t increment = static_cast<uint32_t>(
-                    static_cast<int64_t>(settings_.initial_window_size) - conn_local_window_);
-                co_await send_window_update(0, increment);
-                conn_local_window_ = settings_.initial_window_size;
             }
 
             // 推送数据到流的读取队列.
@@ -1004,8 +1017,20 @@ namespace h2x {
             window_update_frame wuf(fc.data_, fc.size_);
             uint32_t increment = wuf.get_window_increment();
 
+            // RFC 7540 §6.9: WINDOW_UPDATE 增量必须非 0.
+            if (increment == 0) {
+                co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                abort_ = true;
+                co_return;
+            }
+
             if (sid == 0) {
-                // 连接级窗口更新.
+                // 连接级窗口更新. RFC 7540 §6.9.1: 窗口超过 2^31-1 是连接错误.
+                if (conn_remote_window_ + increment > 0x7FFFFFFF) {
+                    co_await send_goaway(0, http2_error_code::FLOW_CONTROL_ERROR);
+                    abort_ = true;
+                    co_return;
+                }
                 conn_remote_window_ += increment;
                 // 通知所有等待发送的写入者（连接级窗口影响所有流）.
                 for (auto& [id, sd] : streams_) {
@@ -1018,6 +1043,11 @@ namespace h2x {
                 // 流级窗口更新.
                 auto it = streams_.find(sid);
                 if (it != streams_.end()) {
+                    if (it->second.remote_window + increment > 0x7FFFFFFF) {
+                        co_await send_goaway(0, http2_error_code::FLOW_CONTROL_ERROR);
+                        abort_ = true;
+                        co_return;
+                    }
                     it->second.remote_window += increment;
                     // 通知等待发送的写入者.
                     if (it->second.write_waiter) {

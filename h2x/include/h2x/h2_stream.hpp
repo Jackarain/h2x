@@ -502,7 +502,10 @@ namespace h2x {
         // 分配新的流 ID.
         uint32_t new_id = allocate_stream_id();
         if (new_id == 0) {
-            ec = make_error_code(errc::stream_already_exists);
+            // 流 ID 空间耗尽: 发起 GOAWAY 并返回错误.
+            co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+            abort_ = true;
+            ec = make_error_code(errc::protocol_error);
             co_return ec;
         }
 
