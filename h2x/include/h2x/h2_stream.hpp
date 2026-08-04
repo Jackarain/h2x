@@ -98,34 +98,96 @@ namespace h2x {
 
             if (!is_writable(*sd, ec)) co_return ec;
 
-            // 构建 HEADERS 帧.
-            auto data = std::vector<uint8_t>(conn_->settings_.max_frame_size + 9);
-            headers_frame hf(data.data(), data.size(), false);
-            hf.stream_id(stream_id_);
-            hf.end_stream_ = end_stream;
-            hf.end_headers_ = true;
+            // 打包头部块. 头部块可能超过单帧负载上限 (尤其当 SETTINGS
+            // MAX_FRAME_SIZE 较小时), 故先打包到足够大的缓冲区, 再按需拆分.
+            // 传入动态表指针, 使打包阶段能正确编码动态表命中的索引条目.
+            const size_t max_payload = conn_->peer_max_frame_size_;
+            const size_t max_block = 1024 * 1024;  // 头部块安全上限.
+            size_t buf_size = max_payload + 9;
+            std::vector<uint8_t> data;
+            int total = -1;
 
-            for (auto& [name, value] : headers) {
-                hf.add_header(name, value,
-                    &conn_->dynamic_table_map_, &conn_->dynamic_table_);
+            while (total < 0) {
+                data.assign(buf_size, 0);
+                headers_frame hf(data.data(), data.size(), false,
+                    &conn_->dynamic_table_);
+                hf.stream_id(stream_id_);
+                hf.end_stream_ = end_stream;
+                hf.end_headers_ = true;
+
+                for (auto& [name, value] : headers) {
+                    hf.add_header(name, value,
+                        &conn_->dynamic_table_map_, &conn_->dynamic_table_);
+                }
+
+                total = hf.pack_headers();
+
+                if (total >= 0) {
+                    // 打包成功后才把增量索引条目加入动态表; 失败的条目
+                    // 不加入, 保证编码端表状态与实际发送内容一致.
+                    for (auto& entry : hf.headers_) {
+                        if (entry.type_ == &G_LITERAL_INCREMENTAL_INDEXING) {
+                            conn_->add_to_dynamic_table(entry);
+                        }
+                    }
+                    break;
+                }
+
+                if (buf_size > max_block) {
+                    ec = make_error_code(errc::protocol_error);
+                    co_return ec;
+                }
+                buf_size *= 2;
             }
 
-            int total = hf.pack_headers();
-            if (total < 0 || static_cast<size_t>(total) > data.size()) {
-                ec = make_error_code(errc::protocol_error);
-                co_return ec;
-            }
+            // 发送帧: 单帧, 或拆分为 HEADERS + CONTINUATION (RFC 7540 §6.2).
+            const size_t block_size = static_cast<size_t>(total) - 9;
+            if (block_size <= max_payload) {
+                data.resize(static_cast<size_t>(total));
+                conn_->write_frame_data(std::move(data));
+            } else {
+                const uint8_t* block = data.data() + 9;
+                size_t offset = 0;
 
-            // 将 LITERAL_INCREMENTAL_INDEXING 条目加入动态表.
-            for (auto& entry : hf.headers_) {
-                if (entry.type_ == &G_LITERAL_INCREMENTAL_INDEXING) {
-                    conn_->add_to_dynamic_table(entry);
+                // 首帧 HEADERS: 不携带 END_HEADERS/END_STREAM (二者由最后的
+                // CONTINUATION 帧携带).
+                size_t chunk = max_payload;
+                std::vector<uint8_t> first(9 + chunk);
+                std::memcpy(first.data(), data.data(), 9);
+                std::memcpy(first.data() + 9, block, chunk);
+                first[0] = (chunk >> 16) & 0xFF;
+                first[1] = (chunk >> 8) & 0xFF;
+                first[2] = chunk & 0xFF;
+                first[4] &= ~static_cast<uint8_t>(frame_flag::END_HEADERS);
+                first[4] &= ~static_cast<uint8_t>(frame_flag::END_STREAM);
+                conn_->write_frame_data(std::move(first));
+                offset += chunk;
+
+                // 后续 CONTINUATION 帧.
+                while (offset < block_size) {
+                    chunk = std::min(block_size - offset, max_payload);
+                    const bool is_last = (offset + chunk >= block_size);
+                    std::vector<uint8_t> cf(9 + chunk);
+                    cf[0] = (chunk >> 16) & 0xFF;
+                    cf[1] = (chunk >> 8) & 0xFF;
+                    cf[2] = chunk & 0xFF;
+                    cf[3] = static_cast<uint8_t>(frame_type::CONTINUATION);
+                    cf[4] = 0;
+                    cf[5] = (stream_id_ >> 24) & 0x7F;
+                    cf[6] = (stream_id_ >> 16) & 0xFF;
+                    cf[7] = (stream_id_ >> 8) & 0xFF;
+                    cf[8] = stream_id_ & 0xFF;
+                    if (is_last) {
+                        cf[4] |= static_cast<uint8_t>(frame_flag::END_HEADERS);
+                        if (end_stream) {
+                            cf[4] |= static_cast<uint8_t>(frame_flag::END_STREAM);
+                        }
+                    }
+                    std::memcpy(cf.data() + 9, block + offset, chunk);
+                    conn_->write_frame_data(std::move(cf));
+                    offset += chunk;
                 }
             }
-
-            // 发送帧.
-            data.resize(total);
-            conn_->write_frame_data(std::move(data));
 
             // 更新流状态.
             transition_local_end_stream(*sd, end_stream);

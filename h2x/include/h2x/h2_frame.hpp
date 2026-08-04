@@ -288,11 +288,13 @@ namespace h2x {
         uint8_t byte = static_cast<uint8_t>(value);
 
         if (value < mask) {
-            byte |= value; // 低 nbit 位为 value, 高位不变
+            byte = static_cast<uint8_t>(value); // 低 nbit 位为 value, 高位不变
             result.push_back(byte);
             return result;
         } else {
-            byte |= mask;   // 低 nbit 位为 mask, 高位不变
+            // 首字节只保留低 nbit 位全 1 (mask); 若沿用 value 的高位,
+            // 调用方随后 OR 入 opcode 时会被 value 高位污染 (RFC 7541 §5.1).
+            byte = mask;
             result.push_back(byte);
             value -= mask;
         }
@@ -884,8 +886,10 @@ namespace h2x {
             // 填充 header block
             for (const auto& entry : headers_) {
                 int bytes = pack_header_block(entry, payload, size);
+                // 任一头部放不下时整体失败, 而不是静默跳过: 静默跳过会让
+                // 发送方与对端的 HPACK 解码表失步, 并产生截断的头部块.
                 if (bytes <= 0) {
-                    continue;
+                    return -1;
                 }
 
                 payload += bytes;
@@ -920,8 +924,9 @@ namespace h2x {
                 payload += nbytes;
                 size -= nbytes;
 
-                // 检查值是否需要更新
-                const header_entry* tmp = hpack_index_to_frame(static_cast<uint32_t>(entry.index_));
+                // 检查值是否需要更新 (传入 dynamic_table_ 才能解析动态表索引).
+                const header_entry* tmp = hpack_index_to_frame(
+                    static_cast<uint32_t>(entry.index_), dynamic_table_);
                 if (tmp && tmp->value_ == entry.value_) {
                     return nbytes;
                 }
@@ -1125,6 +1130,11 @@ namespace h2x {
                     if (static_cast<size_t>(dit->second) < dyn_table->size()) {
                         headers_.push_back((*dyn_table)[dit->second]);
                         headers_.back().type_ = &G_INDEXED;
+                        // 设置组合表索引 (动态表从 62 开始). 若沿用复制来的
+                        // index_ (恒为 0), 打包时会走字面量分支并先写出 0x80
+                        // 模式字节, 产生对端无法解析的非法 HPACK 块.
+                        headers_.back().index_ =
+                            static_cast<int64_t>(dit->second) + 62;
                         return;
                     }
                 }
