@@ -12,7 +12,6 @@
 #define INCLUDE__2023_10_18__USE_AWAITABLE_HPP
 
 
-#include <boost/type_traits.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/use_awaitable.hpp>
@@ -32,8 +31,7 @@ namespace asio_util
 			: boost::asio::use_awaitable_t<Executor>(file_name, line, function_name)
 		{}
 
-		inline boost::asio::redirect_error_t<
-			typename boost::decay<decltype(boost::asio::use_awaitable_t<Executor>())>::type>
+		inline boost::asio::redirect_error_t<boost::asio::use_awaitable_t<Executor>>
 			operator[](boost::system::error_code& ec) const noexcept
 		{
 			return boost::asio::redirect_error(boost::asio::use_awaitable_t<Executor>(), ec);
