@@ -14,6 +14,8 @@ set(TEST_SOURCES
     frame_test.cpp
     global_data_test.cpp
     error_code_test.cpp
+    connection_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../example/lib_asio.cpp
 )
 
 add_executable(h2x_test ${TEST_SOURCES})
@@ -23,6 +25,7 @@ target_link_libraries(h2x_test
         h2x
         Boost::unit_test_framework
         Boost::system
+        Boost::asio
 )
 
 target_include_directories(h2x_test
