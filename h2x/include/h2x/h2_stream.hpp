@@ -217,6 +217,24 @@ namespace h2x {
 
             if (!is_writable(sd, ec)) co_return ec;
 
+            // 零长度写入: 仅当需要发送 END_STREAM 时, 发送一个空 DATA 帧
+            // 来传达流结束, 否则无需发送任何帧.
+            if (size == 0) {
+                if (end_stream) {
+                    auto frame_data = std::vector<uint8_t>(10);
+                    data_frame df(frame_data.data(), frame_data.size(), false);
+                    df.stream_id(stream_id_);
+                    df.type(frame_type::DATA);
+                    df.set_end_stream(true);
+                    df.pack_payload();
+
+                    frame_data.resize(df.frame_size());
+                    conn_->write_frame_data(std::move(frame_data));
+                    transition_local_end_stream(sd, true);
+                }
+                co_return ec;
+            }
+
             size_t offset = 0;
             size_t max_payload = std::min(conn_->peer_max_frame_size_,
                                           conn_->settings_.max_frame_size);
