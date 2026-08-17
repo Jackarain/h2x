@@ -18,6 +18,7 @@
 #include <exception>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <span>
 #include <utility>
 #include <cstdint>
@@ -243,7 +244,7 @@ namespace h2x {
 
         size_t encoded_size = encoded.size();
         uint64_t shift = 1;
-        int idx = 1;
+        size_t idx = 1;
 
         do {
             if (idx >= encoded_size) {
@@ -269,7 +270,7 @@ namespace h2x {
             shift <<= 7;
         } while (byte & 128);
 
-        return idx;
+        return static_cast<int>(idx);
     }
 
     // hpack 的整数编码, 返回编码后的字节序列.
@@ -380,17 +381,6 @@ namespace h2x {
         return static_cast<int>(ret + len);
     }
 
-    // 注意，hpack 动态索引表，索引从 62 开始，静态索引表索引从 1 开始.
-    // 下面是 hpack 动态索引表，索引从 62 开始，最大 1024.
-    // 将来移到 connection 类中作为成员变量，每个 connection 有一个动态索引表和静态表(复制一份).
-    // 返回静态表中的第 index 项（index 从 1 开始）.
-    static const header_entry* hpack_static_index(uint32_t index)
-    {
-        if (index == 0 || index > 61)
-            return nullptr;
-        return &global_static_header_table[index - 1];
-    }
-
     // 从组合表（静态 + 动态）中按 index 查找 entry.
     // dynamic_table 可选；为 nullptr 时只查静态表（index 1-61）。
     static const header_entry* hpack_index_to_frame(
@@ -418,16 +408,15 @@ namespace h2x {
     {
         /* 32 bit FNV-1a: http://isthe.com/chongo/tech/comp/fnv/ */
         uint32_t h = 2166136261u;
-        size_t i;
 
-        if (nv.name_.has_value() && nv.value_.has_value()) {
-            for (i = 0; i < (*nv.name_).size(); ++i) {
-                h ^= (*nv.name_)[i];
+        if (nv.name_ && nv.value_) {
+            for (uint8_t c : *nv.name_) {
+                h ^= c;
                 h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
             }
 
-            for (i = 0; i < (*nv.value_).size(); ++i) {
-                h ^= (*nv.value_)[i];
+            for (uint8_t c : *nv.value_) {
+                h ^= c;
                 h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
             }
         }
@@ -625,7 +614,7 @@ namespace h2x {
         uint16_t identifier_ = 0;   // settings_id 枚举指定设置项的标识.
         uint32_t value_ = 0;        // settings_value 指定设置项的值.
 
-        static const size_t settings_entry_size = 6;
+        static constexpr size_t settings_entry_size = 6;
     };
 
     /**
@@ -817,7 +806,7 @@ namespace h2x {
             }
         }
 
-        int parse_priority(const uint8_t* payload, size_t payload_size)
+        int parse_priority(const uint8_t* payload, size_t)
         {
             // 读取 stream dependency（4 字节）
             uint32_t dep = read_uint32(payload);
@@ -954,7 +943,8 @@ namespace h2x {
             }
 
             // 填充 value
-            std::string value_str = entry.value_.value_or("");
+            std::string_view value_str;
+            if (entry.value_) value_str = *entry.value_;
             auto ret = hpack_pack({(const uint8_t*)value_str.data(), value_str.size()});
 
             if (size < ret.size()) {
@@ -1069,7 +1059,7 @@ namespace h2x {
                 if (ret < 0) {
                     throw std:: runtime_error("headers_frame:  hpack_unpack name failed");
                 }
-                entry.name_.emplace(name.begin(), name.end());
+                entry.name_.emplace(reinterpret_cast<const char*>(name.data()), name.size());
                 nbytes += ret;
                 payload += ret;
                 size -= ret;
@@ -1105,7 +1095,7 @@ namespace h2x {
             }
             nbytes += ret;
 
-            entry.value_.emplace(value.begin(), value.end());
+            entry.value_.emplace(reinterpret_cast<const char*>(value.data()), value.size());
             entry.type_ = op;
             headers_.push_back(entry);
 
@@ -1746,7 +1736,7 @@ namespace h2x {
      * @brief PING 帧封装，携带 8 字节的 opaque 数据与 ACK 标志。
      */
     struct ping_frame : public frame_codec {
-        static const size_t ping_data_size = 8;
+        static constexpr size_t ping_data_size = 8;
 
         ping_frame(uint8_t* data, size_t size, bool unpack = true)
             : frame_codec(data, size)
