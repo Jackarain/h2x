@@ -24,6 +24,7 @@
 
 #include <boost/asio/strand.hpp>
 #include <boost/asio/steady_timer.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/co_spawn.hpp>
@@ -567,10 +568,7 @@ namespace h2x {
                         sd.remote_window += delta;
                         // 窗口增大后必须唤醒等待发送的写入者; 否则发送协程
                         // 即使窗口已恢复也会永久挂起.
-                        if (sd.write_waiter) {
-                            sd.write_waiter();
-                            sd.write_waiter = nullptr;
-                        }
+                        wake_waiter(sd.write_waiter);
                     }
                     break;
                 }
@@ -656,12 +654,14 @@ namespace h2x {
             std::function<void()> write_waiter;
         };
 
-        // 唤醒一个 waiter 槽位并清空, 供所有"通知等待者"路径复用.
+        // 唤醒一个 waiter 槽位. 注意: 唤醒时不清理槽位, 槽位由挂起的
+        // 协程恢复后自行清空 (见 wait_for). 这样在"唤醒后、协程恢复前"
+        // 槽位仍非空, 使 maybe_release_stream 不会在该窗口内删除流状态,
+        // 避免协程恢复时访问已释放的流状态导致 use-after-free.
         static void wake_waiter(std::function<void()>& waiter)
         {
             if (waiter) {
                 waiter();
-                waiter = nullptr;
             }
         }
 
@@ -991,8 +991,17 @@ namespace h2x {
                 wake_waiter(it->second.read_waiter);
                 wake_waiter(it->second.write_waiter);
 
-                // 重置流的缓冲数据已不可读, 唤醒等待者后直接移除, 防止累积.
-                streams_.erase(it);
+                // 重置流的缓冲数据已不可读, 唤醒等待者后延迟移除, 防止累积.
+                // 延迟到被唤醒的协程恢复 (清空 waiter 槽位) 后再删除,
+                // 避免协程恢复时访问已释放的流状态; 若仍有协程挂起则保留.
+                net::post(strand_, [self = this->shared_from_this(), sid] {
+                    auto it = self->streams_.find(sid);
+                    if (it == self->streams_.end())
+                        return;
+                    if (it->second.read_waiter || it->second.write_waiter)
+                        return;
+                    self->streams_.erase(it);
+                });
             }
             co_return;
         }
