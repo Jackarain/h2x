@@ -220,10 +220,12 @@ namespace h2x {
                     }
                 }
 
-                // 发送连接设置帧.
-                uint8_t bufs[256] = {0};
+                // 构建并发送连接设置帧.
+                // 缓冲区按最大帧大小分配, 避免对端 SETTINGS 帧过大时
+                // 因固定 256 字节缓冲区而误报 frame_size_error.
+                std::vector<uint8_t> bufs(settings_.max_frame_size + 9);
 
-                settings_frame sf(bufs, sizeof(bufs), false);
+                settings_frame sf(bufs.data(), bufs.size(), false);
 
                 sf.entries_.emplace_back(settings_id::SETTINGS_HEADER_TABLE_SIZE, s.header_table_size);
                 sf.entries_.emplace_back(settings_id::SETTINGS_ENABLE_PUSH, s.enable_push);
@@ -236,7 +238,6 @@ namespace h2x {
 
                 sf.pack_settings();
 
-                // 发送连接设置帧.
                 co_await async_write_frame(sf, ec);
                 if (ec) {
                     co_return;
@@ -272,7 +273,6 @@ namespace h2x {
                 sf.entries_.clear();
                 sf.pack_settings();
 
-                // 发送连接设置帧 ACK.
                 co_await async_write_frame(sf, ec);
                 if (ec) {
                     co_return;
@@ -316,10 +316,10 @@ namespace h2x {
                         // 确保任何阻塞在 wait_until 的协程能被唤醒并退出.
                         for (auto& [id, sd] : self->streams_) {
                             sd.reset_received = true;
-                            if (sd.read_waiter) { sd.read_waiter(); sd.read_waiter = nullptr; }
-                            if (sd.write_waiter) { sd.write_waiter(); sd.write_waiter = nullptr; }
+                            wake_waiter(sd.read_waiter);
+                            wake_waiter(sd.write_waiter);
                         }
-                        if (self->accept_waiter_) { self->accept_waiter_(); self->accept_waiter_ = nullptr; }
+                        wake_waiter(self->accept_waiter_);
                     },
                     net::detached);
 
@@ -629,6 +629,103 @@ namespace h2x {
             }
         }
 
+        // ── 流状态数据结构 ──
+
+        struct stream_state_data {
+            uint32_t stream_id = 0;
+            stream_state state = stream_state::idle;
+            bool is_remote_initiated = false;
+            bool remote_end_stream = false;
+            bool reset_received = false;
+            bool pending_end_stream = false;  // 暂存分片 HEADERS 的 END_STREAM 标志.
+            bool headers_in_progress = false; // 分片 HEADERS (END_HEADERS 未置位) 是否在途.
+
+            // 流控窗口.
+            int64_t local_window = 65535;
+            int64_t remote_window = 65535;
+
+            // 头部数据.
+            std::vector<header_entry> headers;
+            std::vector<uint8_t> pending_header_block;
+
+            // 数据读取缓冲区.
+            std::vector<uint8_t> read_buffer;
+
+            // 等待者回调（用于通知等待读/写的协程）.
+            std::function<void()> read_waiter;
+            std::function<void()> write_waiter;
+        };
+
+        // 唤醒一个 waiter 槽位并清空, 供所有"通知等待者"路径复用.
+        static void wake_waiter(std::function<void()>& waiter)
+        {
+            if (waiter) {
+                waiter();
+                waiter = nullptr;
+            }
+        }
+
+        // 收到对端 END_STREAM 后的流状态迁移.
+        void mark_remote_end_stream(stream_state_data& sd)
+        {
+            // 仅在流已被 async_accept 拾取后（非 idle）才更新状态.
+            if (sd.state != stream_state::idle) {
+                sd.state = (sd.state == stream_state::half_closed_local)
+                    ? stream_state::closed
+                    : stream_state::half_closed_remote;
+            }
+            sd.remote_end_stream = true;
+        }
+
+        // 从流表中取走一个已就绪的远端流 ID (state==idle 且 is_remote_initiated),
+        // 并将其状态置为 open; 没有可取的流时返回 0.
+        uint32_t take_remote_stream_id()
+        {
+            for (auto& [sid, sd] : streams_) {
+                if (sd.state == stream_state::idle && sd.is_remote_initiated) {
+                    sd.state = stream_state::open;
+                    sd.is_remote_initiated = false;
+                    return sid;
+                }
+            }
+            return 0;
+        }
+
+        // 通用等待: 注册 waiter 后挂起, 直到 pred 满足或被 abort 唤醒.
+        // 实现说明:
+        // - timer 设为永不自然超时 (time_point::max()), 仅靠 waiter_slot()
+        //   即 timer.cancel() 唤醒.
+        // - 注册 waiter 后、挂起前重检谓词, 关闭"注册到挂起之间"的竞态窗口.
+        // - 依赖连接侧在所有改变等待条件的路径 (DATA/HEADERS/WINDOW_UPDATE/
+        //   RST_STREAM/GOAWAY/close/pump 退出) 上调用 waiter_slot() 通知等待者.
+        template <class Pred>
+        net::awaitable<void> wait_for(std::function<void()>& waiter_slot, Pred pred)
+        {
+            boost::system::error_code ec;
+            while (!pred() && !abort_) {
+                net::steady_timer timer(get_executor());
+                timer.expires_at(net::steady_timer::time_point::max());
+
+                waiter_slot = [&timer]() { timer.cancel(); };
+
+                // 注册 waiter 后、挂起前重检, 关闭竞态窗口:
+                // 此段为同步执行 (无 co_await), 同 strand 上 pump 无法插入,
+                // 故事件要么在此被捕获, 要么在挂起后被 waiter_slot() 唤醒.
+                if (pred()) {
+                    waiter_slot = nullptr;
+                    break;
+                }
+
+                co_await timer.async_wait(net_awaitable[ec]);
+                waiter_slot = nullptr;
+
+                if (ec == net::error::operation_aborted) {
+                    ec.clear(); // 被 waiter_slot() 唤醒.
+                }
+            }
+            co_return;
+        }
+
         // 处理接收到的各个类型帧.
         net::awaitable<void> handle_frame(frame_codec& fc)
         {
@@ -735,19 +832,10 @@ namespace h2x {
             }
 
             // 通知等待的读取者.
-            if (sd.read_waiter) {
-                sd.read_waiter();
-                sd.read_waiter = nullptr;
-            }
+            wake_waiter(sd.read_waiter);
 
             if (df.is_end_stream()) {
-                // 仅在流已被 async_accept 拾取后（非 idle）才更新状态.
-                if (sd.state != stream_state::idle) {
-                    sd.state = (sd.state == stream_state::half_closed_local)
-                        ? stream_state::closed
-                        : stream_state::half_closed_remote;
-                }
-                sd.remote_end_stream = true;
+                mark_remote_end_stream(sd);
             }
 
             // 尝试释放已终止且数据已消费完的流.
@@ -827,28 +915,17 @@ namespace h2x {
                 }
 
                 if (hf.end_stream_) {
-                    if (sd.state != stream_state::idle) {
-                        sd.state = (sd.state == stream_state::half_closed_local)
-                            ? stream_state::closed
-                            : stream_state::half_closed_remote;
-                    }
-                    sd.remote_end_stream = true;
+                    mark_remote_end_stream(sd);
                 }
 
                 // 通知等待的读取者.
-                if (sd.read_waiter) {
-                    sd.read_waiter();
-                    sd.read_waiter = nullptr;
-                }
+                wake_waiter(sd.read_waiter);
 
                 // 先唤醒等待者, 再尝试释放终止的流 (避免释放后悬垂引用).
                 maybe_release_stream(sid);
 
                 // 通知 async_accept 有新流到达.
-                if (accept_waiter_) {
-                    accept_waiter_();
-                    accept_waiter_ = nullptr;
-                }
+                wake_waiter(accept_waiter_);
             } else {
                 // 头部块有后续 CONTINUATION 帧 — 暂存原始 payload.
                 // 上一个头部块尚未以 CONTINUATION 结束又收到新的 HEADERS → 协议错误.
@@ -911,14 +988,8 @@ namespace h2x {
                 it->second.reset_received = true;
 
                 // 唤醒该流所有等待者, 使阻塞在 wait_until 的协程即时退出,
-                if (it->second.read_waiter) {
-                    it->second.read_waiter();
-                    it->second.read_waiter = nullptr;
-                }
-                if (it->second.write_waiter) {
-                    it->second.write_waiter();
-                    it->second.write_waiter = nullptr;
-                }
+                wake_waiter(it->second.read_waiter);
+                wake_waiter(it->second.write_waiter);
 
                 // 重置流的缓冲数据已不可读, 唤醒等待者后直接移除, 防止累积.
                 streams_.erase(it);
@@ -992,10 +1063,10 @@ namespace h2x {
             // 使读取者返回 stream_closed 而非干净的 EOF.
             for (auto& [id, sd] : streams_) {
                 sd.reset_received = true;
-                if (sd.read_waiter) { sd.read_waiter(); sd.read_waiter = nullptr; }
-                if (sd.write_waiter) { sd.write_waiter(); sd.write_waiter = nullptr; }
+                wake_waiter(sd.read_waiter);
+                wake_waiter(sd.write_waiter);
             }
-            if (accept_waiter_) { accept_waiter_(); accept_waiter_ = nullptr; }
+            wake_waiter(accept_waiter_);
 
             co_return;
         }
@@ -1023,10 +1094,7 @@ namespace h2x {
                 conn_remote_window_ += increment;
                 // 通知所有等待发送的写入者（连接级窗口影响所有流）.
                 for (auto& [id, sd] : streams_) {
-                    if (sd.write_waiter) {
-                        sd.write_waiter();
-                        sd.write_waiter = nullptr;
-                    }
+                    wake_waiter(sd.write_waiter);
                 }
             } else {
                 // 流级窗口更新.
@@ -1039,10 +1107,7 @@ namespace h2x {
                     }
                     it->second.remote_window += increment;
                     // 通知等待发送的写入者.
-                    if (it->second.write_waiter) {
-                        it->second.write_waiter();
-                        it->second.write_waiter = nullptr;
-                    }
+                    wake_waiter(it->second.write_waiter);
                 }
             }
             co_return;
@@ -1119,24 +1184,12 @@ namespace h2x {
 
                 // 应用分片 HEADERS 帧的 END_STREAM 标志.
                 if (sd.pending_end_stream) {
-                    if (sd.state != stream_state::idle) {
-                        sd.state = (sd.state == stream_state::half_closed_local)
-                            ? stream_state::closed
-                            : stream_state::half_closed_remote;
-                    }
-                    sd.remote_end_stream = true;
+                    mark_remote_end_stream(sd);
                     sd.pending_end_stream = false;
                 }
 
-                if (sd.read_waiter) {
-                    sd.read_waiter();
-                    sd.read_waiter = nullptr;
-                }
-
-                if (accept_waiter_) {
-                    accept_waiter_();
-                    accept_waiter_ = nullptr;
-                }
+                wake_waiter(sd.read_waiter);
+                wake_waiter(accept_waiter_);
 
                 sd.pending_header_block.clear();
                 sd.headers_in_progress = false;
@@ -1372,33 +1425,6 @@ namespace h2x {
 
         // 用于通知 async_accept 有新流到达.
         std::function<void()> accept_waiter_;
-
-        // ── 流状态数据结构 ──
-
-        struct stream_state_data {
-            uint32_t stream_id = 0;
-            stream_state state = stream_state::idle;
-            bool is_remote_initiated = false;
-            bool remote_end_stream = false;
-            bool reset_received = false;
-            bool pending_end_stream = false;  // 暂存分片 HEADERS 的 END_STREAM 标志.
-            bool headers_in_progress = false; // 分片 HEADERS (END_HEADERS 未置位) 是否在途.
-
-            // 流控窗口.
-            int64_t local_window = 65535;
-            int64_t remote_window = 65535;
-
-            // 头部数据.
-            std::vector<header_entry> headers;
-            std::vector<uint8_t> pending_header_block;
-
-            // 数据读取缓冲区.
-            std::vector<uint8_t> read_buffer;
-
-            // 等待者回调（用于通知等待读/写的协程）.
-            std::function<void()> read_waiter;
-            std::function<void()> write_waiter;
-        };
 
         // 流容器.
         std::map<uint32_t, stream_state_data> streams_;

@@ -249,24 +249,10 @@ namespace h2x {
                     }
 
                     // 等待 WINDOW_UPDATE.
-                    net::steady_timer timer(get_executor());
-                    timer.expires_at(net::steady_timer::time_point::max());
-
-                    sd.write_waiter = [&timer]() { timer.cancel(); };
-
-                    // 注册 waiter 后、挂起前重检，关闭竞态窗口.
-                    if (sd.remote_window > 0 && conn_->conn_remote_window_ > 0
-                        || sd.reset_received || conn_->abort_) {
-                        sd.write_waiter = nullptr;
-                        break;
-                    }
-
-                    co_await timer.async_wait(net_awaitable[ec]);
-                    sd.write_waiter = nullptr;
-
-                    if (ec == net::error::operation_aborted) {
-                        ec.clear(); // 被 write_waiter 唤醒，继续循环.
-                    }
+                    co_await conn_->wait_for(sd.write_waiter, [&] {
+                        return sd.remote_window > 0 && conn_->conn_remote_window_ > 0
+                            || sd.reset_received || conn_->abort_;
+                    });
                 }
 
                 if (ec) co_return ec;
@@ -465,41 +451,17 @@ namespace h2x {
 
         // 等待条件满足或流结束/重置，返回是否应继续.
         // pred 返回 true 表示条件满足可退出等待.
-        //
-        // 实现说明:
-        // - timer 设为永不自然超时 (time_point::max()), 仅靠 waiter_slot()
-        //   即 timer.cancel() 唤醒.
-        // - 注册 waiter 后、挂起前重检谓词, 关闭"注册到挂起之间"的竞态窗口.
-        // - 依赖连接侧在所有改变等待条件的路径 (DATA/HEADERS/WINDOW_UPDATE/
-        //   RST_STREAM/GOAWAY/close/pump 退出) 上调用 waiter() 通知等待者.
+        // 复用 connection::wait_for 实现统一的"注册 waiter + 挂起"逻辑.
         template <class Pred>
         net::awaitable<bool> wait_until(
             typename Connection::stream_state_data& sd,
             std::function<void()>& waiter_slot,
             Pred pred)
         {
-            boost::system::error_code ec;
-            while (!pred(sd) && !sd.remote_end_stream && !sd.reset_received && !conn_->abort_) {
-                net::steady_timer timer(get_executor());
-                timer.expires_at(net::steady_timer::time_point::max());
-
-                waiter_slot = [&timer]() { timer.cancel(); };
-
-                // 注册 waiter 后、挂起前重检, 关闭竞态窗口:
-                // 此段为同步执行 (无 co_await), 同 strand 上 pump 无法插入,
-                // 故事件要么在此被捕获, 要么在挂起后被 waiter() 唤醒.
-                if (pred(sd) || sd.remote_end_stream || sd.reset_received) {
-                    waiter_slot = nullptr;
-                    break;
-                }
-
-                co_await timer.async_wait(net_awaitable[ec]);
-                waiter_slot = nullptr;
-
-                if (ec == net::error::operation_aborted) {
-                    ec.clear(); // 被 waiter_slot() 唤醒.
-                }
-            }
+            co_await conn_->wait_for(waiter_slot, [&] {
+                return pred(sd) || sd.remote_end_stream
+                    || sd.reset_received || conn_->abort_;
+            });
             co_return true;
         }
 
@@ -553,46 +515,18 @@ namespace h2x {
         // 等待直到有新的远端流到达.
         while (!abort_) {
             // 先检查已有流.
-            for (auto& [sid, sd] : streams_) {
-                if (sd.state == stream_state::idle &&
-                    sd.is_remote_initiated) {
-                    sd.state = stream_state::open;
-                    sd.is_remote_initiated = false;
-                    stream_type s(this->shared_from_this(), sid);
-                    co_return s;
+            if (uint32_t sid = take_remote_stream_id()) {
+                co_return stream_type(this->shared_from_this(), sid);
+            }
+
+            // 等待新流到达通知 (HEADERS/GOAWAY/close/pump 退出时唤醒).
+            co_await wait_for(accept_waiter_, [this] {
+                for (auto& [sid, sd] : streams_) {
+                    if (sd.state == stream_state::idle && sd.is_remote_initiated)
+                        return true;
                 }
-            }
-
-            // 使用定时器等待，并通过 accept_waiter_ 接收通知.
-            // timer 永不自然超时, 仅靠 accept_waiter_() 即 cancel() 唤醒.
-            // 依赖连接侧在 HEADERS/GOAWAY/close/pump 退出时调用 accept_waiter_() 通知.
-            net::steady_timer timer(get_executor());
-            timer.expires_at(net::steady_timer::time_point::max());
-
-            accept_waiter_ = [&timer]() { timer.cancel(); };
-
-            // 注册 waiter 后、挂起前重检, 关闭竞态窗口.
-            if (abort_) {
-                accept_waiter_ = nullptr;
-                break;
-            }
-            for (auto& [sid, sd] : streams_) {
-                if (sd.state == stream_state::idle &&
-                    sd.is_remote_initiated) {
-                    accept_waiter_ = nullptr;
-                    sd.state = stream_state::open;
-                    sd.is_remote_initiated = false;
-                    stream_type s(this->shared_from_this(), sid);
-                    co_return s;
-                }
-            }
-
-            co_await timer.async_wait(net_awaitable[ec]);
-            accept_waiter_ = nullptr;
-
-            if (ec == net::error::operation_aborted) {
-                ec.clear(); // 被 accept_waiter_ 唤醒，继续循环.
-            }
+                return false;
+            });
         }
 
         ec = make_error_code(errc::stream_closed);
