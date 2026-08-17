@@ -43,15 +43,16 @@ namespace h2x {
         uint8_t pattern_;
     };
 
-    namespace {
-        inline constexpr hpack_op global_hpack_ops[] = {
-            { operation_type::INDEXED,                         7, 0b10000000 }, // 0x80
-            { operation_type::LITERALINCREMENTALINDEXING,      6, 0b01000000 }, // 0x40
-            { operation_type::LITERALWITHOUTINDEXING,          4, 0b00000000 }, // 0x00
-            { operation_type::LITERALNEVERINDEXED,             4, 0b00010000 }, // 0x10
-            { operation_type::DYNAMICTABLESIZEUPDATE,          5, 0b00100000 }, // 0x20
-        };
-    }
+    // 使用 inline 保证所有翻译单元共享同一份 ops 与静态表,
+    // 避免 header-only 库中每个 TU 各自复制一份 (重复内存与启动期构造),
+    // 同时保证跨 TU 的 `type_` 指针比较一致.
+    inline constexpr hpack_op global_hpack_ops[] = {
+        { operation_type::INDEXED,                         7, 0b10000000 }, // 0x80
+        { operation_type::LITERALINCREMENTALINDEXING,      6, 0b01000000 }, // 0x40
+        { operation_type::LITERALWITHOUTINDEXING,          4, 0b00000000 }, // 0x00
+        { operation_type::LITERALNEVERINDEXED,             4, 0b00010000 }, // 0x10
+        { operation_type::DYNAMICTABLESIZEUPDATE,          5, 0b00100000 }, // 0x20
+    };
 
     constexpr auto G_INDEXED  = global_hpack_ops[0];
     constexpr auto G_LITERAL_INCREMENTAL_INDEXING  = global_hpack_ops[1];
@@ -80,7 +81,7 @@ namespace h2x {
 
     inline constexpr int32_t global_static_header_table_size = 61;
 
-    static const header_entry global_static_header_table[] = {
+    inline const header_entry global_static_header_table[] = {
         {1, ":authority", "", 3153725150, &G_INDEXED},
         {2, ":method", "GET", 1312632084, &G_INDEXED},
         {3, ":method", "POST", 1623832002, &G_INDEXED},
@@ -144,7 +145,7 @@ namespace h2x {
         {61, "www-authenticate", "", 779865858, &G_INDEXED},
     };
 
-    static const std::unordered_map<uint32_t, int> global_static_header_table_map = {
+    inline const std::unordered_map<uint32_t, int> global_static_header_table_map = {
         {3153725150u, 0},
         {1312632084u, 1},
         {1623832002u, 2},
