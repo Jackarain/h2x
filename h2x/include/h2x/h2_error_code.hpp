@@ -23,42 +23,22 @@ namespace h2x {
 	 */
 	class error_category_impl;
 
-	template <class error_category>
-	const boost::system::error_category& error_category_single()
-	{
-		static error_category error_category_instance;
-
-		return reinterpret_cast<const boost::system::error_category&>(
-				error_category_instance);
-	}
-
-	inline const boost::system::error_category& error_category()
-	{
-		return error_category_single<h2x::error_category_impl>();
-	}
-
 	namespace errc {
 		/**
 		 * @brief 库使用的错误代码枚举（可转换为 boost::system::error_code）。
 		 */
 		enum errc_t
 		{
-            success = 0,
-            stream_not_found = 1,
-            stream_already_exists = 2,
-            connection_error = 3,
-            flow_control_error = 4,
-            protocol_error = 5,
-            frame_size_error = 6,
-            stream_closed = 7,
-            next_layer_not_open = 8,
+			success = 0,
+			stream_not_found = 1,
+			stream_already_exists = 2,
+			connection_error = 3,
+			flow_control_error = 4,
+			protocol_error = 5,
+			frame_size_error = 6,
+			stream_closed = 7,
+			next_layer_not_open = 8,
 		};
-
-		inline boost::system::error_code make_error_code(errc_t e)
-		{
-			return boost::system::error_code(
-				static_cast<int>(e), h2x::error_category());
-		}
 	}
 
 	class error_category_impl
@@ -73,29 +53,45 @@ namespace h2x {
 		{
 			switch (static_cast<errc::errc_t>(e))
 			{
-            case errc::success:
-                return "Success";
-            case errc::stream_not_found:
-                return "Stream not found";
-            case errc::stream_already_exists:
-                return "Stream already exists";
-            case errc::connection_error:
-                return "Connection error";
-            case errc::flow_control_error:
-                return "Flow control error";
-            case errc::protocol_error:
-                return "Protocol error";
-            case errc::frame_size_error:
-                return "Frame size error";
-            case errc::stream_closed:
-                return "Stream closed";
+			case errc::success:
+				return "Success";
+			case errc::stream_not_found:
+				return "Stream not found";
+			case errc::stream_already_exists:
+				return "Stream already exists";
+			case errc::connection_error:
+				return "Connection error";
+			case errc::flow_control_error:
+				return "Flow control error";
+			case errc::protocol_error:
+				return "Protocol error";
+			case errc::frame_size_error:
+				return "Frame size error";
+			case errc::stream_closed:
+				return "Stream closed";
 			case errc::next_layer_not_open:
-                return "NextLayer is not open";
-            default:
-                return "Unknown error";
+				return "NextLayer is not open";
+			default:
+				return "Unknown error";
 			}
 		}
 	};
+
+	// 以函数局部静态变量延迟初始化类别实例, 避免静态初始化顺序问题,
+	// 同时省去 reinterpret_cast 的模板间接层.
+	inline const boost::system::error_category& error_category()
+	{
+		static const error_category_impl instance;
+		return instance;
+	}
+
+	namespace errc {
+		inline boost::system::error_code make_error_code(errc_t e) noexcept
+		{
+			return boost::system::error_code(
+				static_cast<int>(e), error_category());
+		}
+	}
 
 }
 
