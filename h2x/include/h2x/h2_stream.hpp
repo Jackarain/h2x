@@ -110,14 +110,14 @@ namespace h2x {
             while (total < 0) {
                 data.assign(buf_size, 0);
                 headers_frame hf(data.data(), data.size(), false,
-                    &conn_->dynamic_table_);
+                    &conn_->enc_dynamic_table_);
                 hf.stream_id(stream_id_);
                 hf.end_stream_ = end_stream;
                 hf.end_headers_ = true;
 
                 for (auto& [name, value] : headers) {
                     hf.add_header(name, value,
-                        &conn_->dynamic_table_map_, &conn_->dynamic_table_);
+                        &conn_->enc_dynamic_table_map_, &conn_->enc_dynamic_table_);
                 }
 
                 total = hf.pack_headers();
@@ -127,7 +127,10 @@ namespace h2x {
                     // 不加入, 保证编码端表状态与实际发送内容一致.
                     for (auto& entry : hf.headers_) {
                         if (entry.type_ == &G_LITERAL_INCREMENTAL_INDEXING) {
-                            conn_->add_to_dynamic_table(entry);
+                            conn_->dynamic_table_add(conn_->enc_dynamic_table_,
+                                &conn_->enc_dynamic_table_map_,
+                                conn_->enc_dynamic_table_size_, entry,
+                                conn_->settings_.header_table_size);
                         }
                     }
                     break;
