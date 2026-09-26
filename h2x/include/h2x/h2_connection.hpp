@@ -1122,13 +1122,32 @@ namespace h2x {
         net::awaitable<void> handle_window_update_frame(frame_codec& fc)
         {
             auto sid = fc.stream_id();
+
+            // WINDOW_UPDATE 负载必须恰为 4 字节 (RFC 7540 §6.9): 连接错误.
+            if (fc.payload_size() != 4) {
+                co_await send_goaway(0, http2_error_code::FRAME_SIZE_ERROR);
+                abort_ = true;
+                co_return;
+            }
+
             window_update_frame wuf(fc.data_, fc.size_);
             uint32_t increment = wuf.get_window_increment();
 
-            // RFC 7540 §6.9: WINDOW_UPDATE 增量必须非 0.
+            // RFC 7540 §6.9: 增量必须非 0. 连接级为连接错误, 流级为流错误.
             if (increment == 0) {
-                co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
-                abort_ = true;
+                if (sid == 0) {
+                    co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                    abort_ = true;
+                    co_return;
+                }
+                auto it = streams_.find(sid);
+                if (it != streams_.end()) {
+                    it->second.state = stream_state::closed;
+                    it->second.reset_received = true;
+                    wake_waiter(it->second.read_waiter);
+                    wake_waiter(it->second.write_waiter);
+                    co_await send_rst_stream(sid, http2_error_code::PROTOCOL_ERROR);
+                }
                 co_return;
             }
 

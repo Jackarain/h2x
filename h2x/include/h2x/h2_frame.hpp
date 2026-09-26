@@ -1800,11 +1800,9 @@ namespace h2x {
             }
 
             // 前 1 位是保留位，后 31 位是窗口大小增量
+            // 增量 0 属语义错误 (RFC 7540 §6.9): 由连接层区分连接/流错误,
+            // 这里不做限制, 否则会以异常形式吞掉, 无法回送正确的错误帧.
             window_increment_ = ((payload[0] & 0x7F) << 24) | (payload[1] << 16) | (payload[2] << 8) | payload[3];
-
-            if (window_increment_ == 0) {
-                throw std::runtime_error("window_update_frame: window increment must be > 0");
-            }
         }
 
         // 打包 WINDOW_UPDATE 帧
