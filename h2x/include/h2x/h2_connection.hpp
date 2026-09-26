@@ -1327,9 +1327,11 @@ namespace h2x {
         {
             boost::system::error_code ec;
 
-            while (!abort_) {
-                while (out_queue_.empty()) {
-                    if (abort_) break;
+            // 退出条件基于"队列已空"而非仅 abort_: abort_ 置位后仍需把
+            // 已排队的控制帧 (例如连接错误的 GOAWAY) 冲刷出去, 否则对端
+            // 只会看到 TCP 连接被关闭而收不到任何错误信息.
+            while (true) {
+                while (out_queue_.empty() && !abort_) {
                     // 输出队列为空时, 等待.
                     // timer 永不自然超时, 仅靠 write_frame_data 中的
                     // out_notifier_.cancel() 唤醒.
@@ -1339,7 +1341,8 @@ namespace h2x {
                     if (ec == net::error::operation_aborted)
                         ec.clear(); // 被 write_frame_data 唤醒.
                 }
-                if (abort_) break;
+                if (out_queue_.empty())
+                    break;
                 // 从输出队列中取出数据.
                 auto data = std::move(out_queue_.front());
                 out_queue_.pop_front();
@@ -1400,13 +1403,26 @@ namespace h2x {
                 }
             }
 
-            // pump_in 退出时, 唤醒 pump_out 并关闭 socket, 确保 pump_out
-            // 不会在 async_wait 或 async_write 上永久阻塞.
+            // pump_in 退出时, 唤醒 pump_out, 并给它一个有界窗口把队列中的
+            // 控制帧 (如 GOAWAY) 冲刷出去, 避免对端只看到 TCP 关闭.
+            // 队列清空即提前返回, 最多等待 200ms.
             // (&& 使用 wait_for_one_error, 仅在一方出错时取消另一方;
             //  若 pump_in 正常返回 (如 abort_ 被设置) 则不会取消 pump_out,
             //  导致 pump_out 永久阻塞在 out_notifier_.async_wait(), 进而
             //  使 && 永不完成, 唤醒等待者的 post-pump 代码永不执行 → 死锁.)
             out_notifier_.cancel();
+            {
+                auto deadline = std::chrono::steady_clock::now()
+                    + std::chrono::milliseconds(200);
+                while (!out_queue_.empty()
+                       && std::chrono::steady_clock::now() < deadline) {
+                    boost::system::error_code ignored;
+                    net::steady_timer drain_timer(get_executor());
+                    drain_timer.expires_after(std::chrono::milliseconds(2));
+                    co_await drain_timer.async_wait(net_awaitable[ignored]);
+                }
+            }
+            // 关闭 socket, 确保 pump_out 不会在 async_wait/async_write 上永久阻塞.
             {
                 boost::system::error_code ignored;
                 next_layer_.lowest_layer().close(ignored);
