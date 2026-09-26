@@ -38,6 +38,7 @@ struct connection_test_state {
     bool headers_ok = false;  // 收到 :status 301.
     bool clean_eof = false;   // body 读取干净结束 (无错误).
     size_t body_bytes = 0;    // 读取到的 body 字节数.
+    int dup_headers = 0;      // 同一头部块内自引用动态表索引解出的条数.
 };
 
 // ── 帧构建辅助 (模拟服务端) ──
@@ -529,6 +530,97 @@ static net::awaitable<void> run_bad_settings_client(
     conn->close();
 }
 
+
+// 服务端: 响应头块内部先以增量索引加入 "x-a: b", 再引用索引 62 (刚加入的
+// 表项). 解码器必须按顺序在解析过程中更新动态表, 否则索引 62 无法解析.
+static net::awaitable<void> run_self_reference_server(net::ip::tcp::socket sock)
+{
+    boost::system::error_code ec;
+
+    std::vector<uint8_t> preface(24);
+    co_await net::async_read(sock, net::buffer(preface), net_awaitable[ec]);
+    if (ec) co_return;
+
+    if ((co_await read_frame(sock)).empty()) co_return;
+    auto sf = build_settings_frame(false);
+    co_await net::async_write(sock, net::buffer(sf), net_awaitable[ec]);
+    if (ec) co_return;
+
+    if ((co_await read_frame(sock)).empty()) co_return;
+    auto sa = build_settings_frame(true);
+    co_await net::async_write(sock, net::buffer(sa), net_awaitable[ec]);
+    if (ec) co_return;
+
+    if ((co_await read_frame(sock)).empty()) co_return;
+
+    // HPACK: 0x88 (:status 200)
+    //       0x40 0x03 "x-a" 0x01 "b"  -> 增量索引加入, 成为索引 62
+    //       0xBE                       -> 引用索引 62
+    const std::vector<uint8_t> block = {
+        0x88,
+        0x40, 0x03, 'x', '-', 'a', 0x01, 'b',
+        0xBE,
+    };
+    auto hf = build_raw_frame(1, static_cast<uint8_t>(frame_type::HEADERS),
+        static_cast<uint8_t>(frame_flag::END_HEADERS), block.data(), block.size());
+    co_await net::async_write(sock, net::buffer(hf), net_awaitable[ec]);
+    if (ec) co_return;
+
+    auto endf = build_data_frame(1, "", true);
+    co_await net::async_write(sock, net::buffer(endf), net_awaitable[ec]);
+
+    std::vector<uint8_t> ignore(1);
+    co_await net::async_read(sock, net::buffer(ignore), net_awaitable[ec]);
+}
+
+// 客户端: 校验同一头部块内的动态表自引用能被正确解析.
+static net::awaitable<void> run_self_reference_client(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    using conn_type = connection<net::ip::tcp::socket>;
+    auto conn = std::make_shared<conn_type>(std::move(sock));
+
+    settings s;
+    co_await conn->async_handshake(role::client, s, ec);
+    if (ec) { st.error = "client: handshake: " + ec.message(); co_return; }
+
+    auto req = co_await conn->async_request();
+    if (!req.has_value()) {
+        st.error = "client: async_request: " + req.error().message(); co_return;
+    }
+    auto stream = std::move(req.value());
+
+    ec = co_await stream.async_write_headers({
+        {":method", "GET"}, {":path", "/"}, {":scheme", "https"},
+        {":authority", "test.local"},
+    }, true);
+    if (ec) { st.error = "client: write headers: " + ec.message(); co_return; }
+
+    auto hdr = co_await stream.async_read_headers();
+    if (!hdr.has_value()) {
+        st.error = "client: read headers: " + hdr.error().message(); co_return;
+    }
+    for (auto& h : hdr.value()) {
+        if (h.name_ && *h.name_ == ":status" && h.value_ && *h.value_ == "200") {
+            st.headers_ok = true;
+        }
+        if (h.name_ && *h.name_ == "x-a" && h.value_ && *h.value_ == "b") {
+            ++st.dup_headers;
+        }
+    }
+
+    auto data = co_await stream.async_read_data();
+    if (!data.has_value()) {
+        st.error = "client: read data: " + data.error().message(); co_return;
+    }
+    st.clean_eof = data.value().empty();
+
+    conn->close();
+    co_await conn->async_wait_pump(3s);
+}
+
 BOOST_AUTO_TEST_SUITE(connection_lifecycle)
 
 // 回归测试: 响应以空 DATA + END_STREAM 结束时, 流释放不得早于
@@ -711,6 +803,49 @@ BOOST_AUTO_TEST_CASE(peer_settings_invalid_max_frame_size)
     BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
 }
 
+// 回归: 同一头部块内先用增量索引加入表项, 再引用该表项 (索引 62),
+// 解码器必须边解析边更新动态表; 否则索引越界触发 COMPRESSION_ERROR.
+BOOST_AUTO_TEST_CASE(hpack_self_reference_within_block)
+{
+    net::io_context ioc(1);
+    connection_test_state st;
+
+    net::ip::tcp::acceptor acceptor(
+        ioc, net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    auto port = acceptor.local_endpoint().port();
+
+    net::steady_timer watchdog(ioc);
+    watchdog.expires_after(10s);
+    watchdog.async_wait([&](boost::system::error_code ec) {
+        if (!ec) { st.error = "test timeout"; ioc.stop(); }
+    });
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        auto sock = co_await acceptor.async_accept(net_awaitable[ec]);
+        if (ec) { st.error = "accept: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_self_reference_server(std::move(sock));
+        ioc.stop();
+    }, net::detached);
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        net::ip::tcp::socket sock(ioc);
+        std::vector<net::ip::tcp::endpoint> endpoints{
+            net::ip::tcp::endpoint(net::ip::make_address("127.0.0.1"), port)};
+        co_await net::async_connect(sock, endpoints, net_awaitable[ec]);
+        if (ec) { st.error = "connect: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_self_reference_client(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    ioc.run();
+
+    BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
+    BOOST_CHECK(st.headers_ok);
+    BOOST_CHECK_EQUAL(st.dup_headers, 2);
+    BOOST_CHECK(st.clean_eof);
+}
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace h2x

@@ -426,6 +426,49 @@ namespace h2x {
 
     ////////////////////////////////////////////////////////////////////////////////
 
+    // 向 HPACK 动态表插入表项并按上限驱逐旧条目 (RFC 7541 §4.3/§4.4).
+    // map 仅编码方向使用 (hash -> 表内索引), 解码方向不需要, 传 nullptr.
+    inline void hpack_dynamic_table_add(std::vector<header_entry>& table,
+                                        std::unordered_map<uint32_t, int>* map,
+                                        size_t& table_size,
+                                        const header_entry& entry,
+                                        size_t max_size)
+    {
+        size_t entry_size = 32;
+        if (entry.name_) entry_size += entry.name_->size();
+        if (entry.value_) entry_size += entry.value_->size();
+
+        // 单个表项超过上限时清空整表 (该表项本身也不加入).
+        if (entry_size > max_size) {
+            table.clear();
+            if (map) map->clear();
+            table_size = 0;
+            return;
+        }
+
+        while (table_size + entry_size > max_size && !table.empty()) {
+            auto& old = table.back();
+            size_t old_size = 32;
+            if (old.name_) old_size += old.name_->size();
+            if (old.value_) old_size += old.value_->size();
+            table_size -= old_size;
+            if (map) map->erase(old.hash_);
+            table.pop_back();
+        }
+
+        table.insert(table.begin(), entry);
+        table_size += entry_size;
+
+        if (map) {
+            (*map)[entry.hash_] = 0;
+            for (size_t i = table.size(); i > 0; --i) {
+                (*map)[table[i - 1].hash_] = static_cast<int>(i - 1);
+            }
+        }
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////
+
     /**
      * @brief HTTP/2 帧类型枚举（frame_type）。
      *
@@ -740,6 +783,16 @@ namespace h2x {
         void set_dynamic_table(const std::vector<header_entry>* dt)
         {
             dynamic_table_ = dt;
+        }
+
+        // 设置解码方向的动态表上下文; 设置后 unpack 过程中会就地维护表状态,
+        // 使同一头部块内后续字段能引用到刚加入的表项 (RFC 7541 §6.2.1).
+        void set_decoder_table(std::vector<header_entry>* table, size_t* table_size,
+                               size_t max_size)
+        {
+            dec_table_ = table;
+            dec_table_size_ = table_size;
+            dec_table_max_ = max_size;
         }
 
         // 提取 flag 解析逻辑
@@ -1097,7 +1150,17 @@ namespace h2x {
 
             entry.value_.emplace(reinterpret_cast<const char*>(value.data()), value.size());
             entry.type_ = op;
+            // 计算名/值哈希; unpack_indexed 会从被引用表项复制该值, 此处若不
+            // 设置将保持未初始化 (header_entry 无默认初始化).
+            entry.hash_ = frame_header_hash(entry);
             headers_.push_back(entry);
+
+            // 解码方向: 增量索引表项必须边解析边写入动态表, 使同一头部块
+            // 内后续字段可引用它 (RFC 7541 §6.2.1).
+            if (dec_table_ && op->type_ == operation_type::LITERALINCREMENTALINDEXING) {
+                hpack_dynamic_table_add(*dec_table_, nullptr, *dec_table_size_,
+                    headers_.back(), dec_table_max_);
+            }
 
             return nbytes;
         }
@@ -1140,6 +1203,11 @@ namespace h2x {
 
         // 指向 connection 动态表的指针（用于解码索引 > 61 的表项）。
         const std::vector<header_entry>* dynamic_table_ = nullptr;
+
+        // 解码方向动态表上下文 (可选): 解析时就地维护表状态.
+        std::vector<header_entry>* dec_table_ = nullptr;
+        size_t* dec_table_size_ = nullptr;
+        size_t dec_table_max_ = 4096;
 
         bool end_stream_ = false;
         bool end_headers_ = false;

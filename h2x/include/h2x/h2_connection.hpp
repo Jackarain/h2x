@@ -916,6 +916,9 @@ namespace h2x {
             // 只解析 flags，不解码 HPACK（避免在 end_headers_=false 时解析截断数据导致异常）.
             headers_frame hf(fc.data_, fc.size_, false, &dec_dynamic_table_);
             hf.parse_flags();
+            // 解码方向动态表上下文: 解析过程中就地加入增量索引表项.
+            hf.set_decoder_table(&dec_dynamic_table_, &dec_dynamic_table_size_,
+                settings_.header_table_size);
 
             if (hf.end_headers_) {
                 // 完整头部块到达 — 执行完整 HPACK 解析.
@@ -932,13 +935,8 @@ namespace h2x {
                     co_return;
                 }
 
-                // 解析 entry 并加入动态表.
+                // 复制解码结果 (动态表已在解析过程中就地更新).
                 for (auto& h : hf.headers_) {
-                    if (h.type_ == &G_LITERAL_INCREMENTAL_INDEXING) {
-                        dynamic_table_add(dec_dynamic_table_, nullptr,
-                            dec_dynamic_table_size_, h,
-                            settings_.header_table_size);
-                    }
                     sd.headers.emplace_back(h);
                 }
 
@@ -1210,14 +1208,12 @@ namespace h2x {
                 // 解析累积的完整头部块，若 HPACK 数据损坏则发送 GOAWAY.
                 bool hpack_error = false;
                 try {
-                    headers_frame cont_hf(tmp.data(), tmp.size(), true, &dec_dynamic_table_);
+                    headers_frame cont_hf(tmp.data(), tmp.size(), false, &dec_dynamic_table_);
+                    cont_hf.set_decoder_table(&dec_dynamic_table_, &dec_dynamic_table_size_,
+                        settings_.header_table_size);
+                    cont_hf.unpack_headers();
 
                     for (auto& h : cont_hf.headers_) {
-                        if (h.type_ == &G_LITERAL_INCREMENTAL_INDEXING) {
-                            dynamic_table_add(dec_dynamic_table_, nullptr,
-                                dec_dynamic_table_size_, h,
-                                settings_.header_table_size);
-                        }
                         sd.headers.emplace_back(h);
                     }
                 } catch (const std::exception&) {
@@ -1288,46 +1284,14 @@ namespace h2x {
         // ── 动态 HPACK 表操作 ──
 
         // 向动态表插入 entry 并按上限驱逐旧条目 (RFC 7541 §4.1/§4.3).
-        // map 用于编码方向维护 hash→索引; 解码方向不需要索引表, 传 nullptr.
+        // 编码/解码方向共用同一实现 (见 hpack_dynamic_table_add).
         static void dynamic_table_add(std::vector<header_entry>& table,
                                       std::unordered_map<uint32_t, int>* map,
                                       size_t& table_size,
                                       const header_entry& entry,
                                       size_t max_size)
         {
-            size_t entry_size = 32;
-            if (entry.name_) entry_size += entry.name_->size();
-            if (entry.value_) entry_size += entry.value_->size();
-
-            // 如果单个 entry 超过上限，则清空整个表.
-            if (entry_size > max_size) {
-                table.clear();
-                if (map) map->clear();
-                table_size = 0;
-                return;
-            }
-
-            // 移除最旧的条目直到有足够空间.
-            while (table_size + entry_size > max_size && !table.empty()) {
-                auto& old = table.back();
-                size_t old_size = 32;
-                if (old.name_) old_size += old.name_->size();
-                if (old.value_) old_size += old.value_->size();
-                table_size -= old_size;
-                if (map) map->erase(old.hash_);
-                table.pop_back();
-            }
-
-            table.insert(table.begin(), entry);
-            table_size += entry_size;
-
-            // 重新索引 (仅编码方向).
-            if (map) {
-                (*map)[entry.hash_] = 0;
-                for (size_t i = table.size(); i > 0; --i) {
-                    (*map)[table[i - 1].hash_] = static_cast<int>(i - 1);
-                }
-            }
+            hpack_dynamic_table_add(table, map, table_size, entry, max_size);
         }
 
         // 用于发送数据的处理 pump.
