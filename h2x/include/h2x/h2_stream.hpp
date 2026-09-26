@@ -130,7 +130,7 @@ namespace h2x {
                             conn_->dynamic_table_add(conn_->enc_dynamic_table_,
                                 &conn_->enc_dynamic_table_map_,
                                 conn_->enc_dynamic_table_size_, entry,
-                                conn_->settings_.header_table_size);
+                                conn_->peer_header_table_size_);
                         }
                     }
                     break;
