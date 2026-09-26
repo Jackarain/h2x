@@ -948,11 +948,6 @@ namespace h2x {
                         co_return;
                     }
                     pad_len = payload[0];
-                    if (pad_len >= plen - 1) {
-                        co_await send_goaway(sid, http2_error_code::PROTOCOL_ERROR);
-                        abort_ = true;
-                        co_return;
-                    }
                     offset += 1;
                 }
                 if (hf.priority_) {
@@ -962,6 +957,13 @@ namespace h2x {
                         co_return;
                     }
                     offset += 5;
+                }
+                // padding 必须整段落在前缀之后: offset + pad_len <= plen,
+                // 否则 payload + plen - pad_len 会早于 payload + offset.
+                if (static_cast<size_t>(pad_len) > plen - offset) {
+                    co_await send_goaway(sid, http2_error_code::PROTOCOL_ERROR);
+                    abort_ = true;
+                    co_return;
                 }
                 sd.pending_header_block.insert(
                     sd.pending_header_block.end(),

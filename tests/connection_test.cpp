@@ -280,6 +280,139 @@ static net::awaitable<void> run_mock_client(
     co_await conn->async_wait_pump(3s);
 }
 
+// ── 构造原始帧并模拟"带 PADDED/PRIORITY 前缀的分片响应头"服务端 ──
+
+// 组装一个裸帧 (9 字节头 + payload).
+static std::vector<uint8_t> build_raw_frame(uint32_t sid, uint8_t type,
+    uint8_t flags, const uint8_t* payload, size_t len)
+{
+    std::vector<uint8_t> f(9 + len, 0);
+    f[0] = (len >> 16) & 0xFF;
+    f[1] = (len >> 8) & 0xFF;
+    f[2] = len & 0xFF;
+    f[3] = type;
+    f[4] = flags;
+    f[5] = (sid >> 24) & 0x7F;
+    f[6] = (sid >> 16) & 0xFF;
+    f[7] = (sid >> 8) & 0xFF;
+    f[8] = sid & 0xFF;
+    if (len) {
+        std::memcpy(f.data() + 9, payload, len);
+    }
+    return f;
+}
+
+// 服务端: 握手后把响应 HEADERS 拆成 "HEADERS(PADDED|PRIORITY, END_HEADERS 未置位)
+// + CONTINUATION". 回归: 前缀+padding 的偏移计算必须正确, 否则会构造反向区间.
+static net::awaitable<void> run_fragmented_headers_server(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    std::vector<uint8_t> preface(24);
+    co_await net::async_read(sock, net::buffer(preface), net_awaitable[ec]);
+    if (ec) { st.error = "server: read preface: " + ec.message(); co_return; }
+
+    if ((co_await read_frame(sock)).empty()) {
+        st.error = "server: read client settings failed"; co_return;
+    }
+    auto sf = build_settings_frame(false);
+    co_await net::async_write(sock, net::buffer(sf), net_awaitable[ec]);
+    if (ec) { st.error = "server: write settings: " + ec.message(); co_return; }
+
+    if ((co_await read_frame(sock)).empty()) {
+        st.error = "server: read client settings ack failed"; co_return;
+    }
+    auto sa = build_settings_frame(true);
+    co_await net::async_write(sock, net::buffer(sa), net_awaitable[ec]);
+    if (ec) { st.error = "server: write settings ack: " + ec.message(); co_return; }
+
+    if ((co_await read_frame(sock)).empty()) {
+        st.error = "server: read request failed"; co_return;
+    }
+
+    // 响应头块 (:status: 200).
+    auto hb_frame = build_headers_frame(1, { {":status", "200"} }, false);
+    std::vector<uint8_t> block(hb_frame.begin() + 9, hb_frame.end());
+    const size_t split = block.size() / 2;
+
+    // HEADERS payload: [pad_len][priority(5字节)][header_block 前半][padding].
+    const uint8_t pad = 3;
+    std::vector<uint8_t> p1;
+    p1.push_back(pad);
+    for (int i = 0; i < 5; ++i) p1.push_back(0);
+    p1.insert(p1.end(), block.begin(), block.begin() + split);
+    for (int i = 0; i < pad; ++i) p1.push_back(0);
+
+    const uint8_t flags1 = static_cast<uint8_t>(frame_flag::PADDED)
+        | static_cast<uint8_t>(frame_flag::PRIORITY);
+    auto f1 = build_raw_frame(1, static_cast<uint8_t>(frame_type::HEADERS),
+        flags1, p1.data(), p1.size());
+
+    auto f2 = build_raw_frame(1, static_cast<uint8_t>(frame_type::CONTINUATION),
+        static_cast<uint8_t>(frame_flag::END_HEADERS),
+        block.data() + split, block.size() - split);
+
+    co_await net::async_write(sock, net::buffer(f1), net_awaitable[ec]);
+    if (ec) { st.error = "server: write headers: " + ec.message(); co_return; }
+    co_await net::async_write(sock, net::buffer(f2), net_awaitable[ec]);
+    if (ec) { st.error = "server: write continuation: " + ec.message(); co_return; }
+
+    // 空 DATA + END_STREAM 结束响应.
+    auto endf = build_data_frame(1, "", true);
+    co_await net::async_write(sock, net::buffer(endf), net_awaitable[ec]);
+    if (ec) { st.error = "server: write end: " + ec.message(); co_return; }
+
+    // 让客户端读完后自然关闭.
+    std::vector<uint8_t> ignore(1);
+    co_await net::async_read(sock, net::buffer(ignore), net_awaitable[ec]);
+}
+
+// 客户端: 发请求并校验能从分片头部块中解出 :status 200, 且读到干净 EOF.
+static net::awaitable<void> run_fragmented_headers_client(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    using conn_type = connection<net::ip::tcp::socket>;
+    auto conn = std::make_shared<conn_type>(std::move(sock));
+
+    settings s;
+    co_await conn->async_handshake(role::client, s, ec);
+    if (ec) { st.error = "client: handshake: " + ec.message(); co_return; }
+
+    auto req = co_await conn->async_request();
+    if (!req.has_value()) {
+        st.error = "client: async_request: " + req.error().message(); co_return;
+    }
+    auto stream = std::move(req.value());
+
+    ec = co_await stream.async_write_headers({
+        {":method", "GET"}, {":path", "/"}, {":scheme", "https"},
+        {":authority", "test.local"},
+    }, true);
+    if (ec) { st.error = "client: write headers: " + ec.message(); co_return; }
+
+    auto hdr = co_await stream.async_read_headers();
+    if (!hdr.has_value()) {
+        st.error = "client: read headers: " + hdr.error().message(); co_return;
+    }
+    for (auto& h : hdr.value()) {
+        if (h.name_ && *h.name_ == ":status" && h.value_ && *h.value_ == "200") {
+            st.headers_ok = true;
+        }
+    }
+
+    auto data = co_await stream.async_read_data();
+    if (!data.has_value()) {
+        st.error = "client: read data: " + data.error().message(); co_return;
+    }
+    st.clean_eof = data.value().empty();
+
+    conn->close();
+    co_await conn->async_wait_pump(3s);
+}
+
 BOOST_AUTO_TEST_SUITE(connection_lifecycle)
 
 // 回归测试: 响应以空 DATA + END_STREAM 结束时, 流释放不得早于
@@ -335,6 +468,48 @@ BOOST_AUTO_TEST_CASE(stream_release_after_empty_data_end_stream)
     BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
     BOOST_CHECK(st.headers_ok);
     BOOST_CHECK_EQUAL(st.body_bytes, 220u);
+    BOOST_CHECK(st.clean_eof);
+}
+
+// 回归: CONTINUATION 分片累积时 padding 与前缀偏移必须匹配,
+// 否则会以反向区间 insert (未定义行为).
+BOOST_AUTO_TEST_CASE(fragmented_headers_padding_priority)
+{
+    net::io_context ioc(1);
+    connection_test_state st;
+
+    net::ip::tcp::acceptor acceptor(
+        ioc, net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    auto port = acceptor.local_endpoint().port();
+
+    net::steady_timer watchdog(ioc);
+    watchdog.expires_after(10s);
+    watchdog.async_wait([&](boost::system::error_code ec) {
+        if (!ec) { st.error = "test timeout"; ioc.stop(); }
+    });
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        auto sock = co_await acceptor.async_accept(net_awaitable[ec]);
+        if (ec) { st.error = "accept: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_fragmented_headers_server(std::move(sock), st);
+    }, net::detached);
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        net::ip::tcp::socket sock(ioc);
+        std::vector<net::ip::tcp::endpoint> endpoints{
+            net::ip::tcp::endpoint(net::ip::make_address("127.0.0.1"), port)};
+        co_await net::async_connect(sock, endpoints, net_awaitable[ec]);
+        if (ec) { st.error = "connect: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_fragmented_headers_client(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    ioc.run();
+
+    BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
+    BOOST_CHECK(st.headers_ok);
     BOOST_CHECK(st.clean_eof);
 }
 
