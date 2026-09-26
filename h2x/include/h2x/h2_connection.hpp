@@ -798,7 +798,9 @@ namespace h2x {
         {
             auto sid = fc.stream_id();
             data_frame df(fc.data_, fc.size_);
-            int64_t data_len = static_cast<int64_t>(df.get_data().size());
+            // 流控按整个 DATA 负载计量, 含 Pad Length 与 Padding 字段
+            // (RFC 7540 §6.9.1); 仅剔除 padding 会让对端用 padding 绕过窗口.
+            int64_t data_len = static_cast<int64_t>(fc.payload_size());
 
             // 连接级窗口: 所有收到的 DATA 都消耗连接级窗口, 无论流是否
             // 存在/已关闭/被重置. 否则被丢弃的 DATA 不入账, 对端连接窗口
