@@ -413,6 +413,69 @@ static net::awaitable<void> run_fragmented_headers_client(
     co_await conn->async_wait_pump(3s);
 }
 
+// 服务端: 接收一个大头部块 (会被拆成 HEADERS + CONTINUATION) 且带
+// END_STREAM 的请求, 校验能读到干净的流结束.
+static net::awaitable<void> run_large_headers_server(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    using conn_type = connection<net::ip::tcp::socket>;
+    auto conn = std::make_shared<conn_type>(std::move(sock));
+
+    settings s;
+    co_await conn->async_handshake(role::server, s, ec);
+    if (ec) { st.error = "server: handshake: " + ec.message(); co_return; }
+
+    auto res = co_await conn->async_accept_stream();
+    if (!res.has_value()) {
+        st.error = "server: accept: " + res.error().message(); co_return;
+    }
+    auto stream = std::move(res.value());
+
+    auto hdr = co_await stream.async_read_headers();
+    if (!hdr.has_value()) {
+        st.error = "server: read headers: " + hdr.error().message(); co_return;
+    }
+    st.headers_ok = true;
+
+    auto data = co_await stream.async_read_data();
+    if (!data.has_value()) {
+        st.error = "server: read data: " + data.error().message(); co_return;
+    }
+    st.clean_eof = data.value().empty();
+
+    conn->close();
+    co_await conn->async_wait_pump(3s);
+}
+
+// 客户端: 发送一个超过默认帧长的请求头且 end_stream=true.
+static net::awaitable<void> run_large_headers_client(
+    net::ip::tcp::socket sock)
+{
+    boost::system::error_code ec;
+
+    using conn_type = connection<net::ip::tcp::socket>;
+    auto conn = std::make_shared<conn_type>(std::move(sock));
+
+    settings s;
+    co_await conn->async_handshake(role::client, s, ec);
+    if (ec) co_return;
+
+    auto req = co_await conn->async_request();
+    if (!req.has_value()) co_return;
+    auto stream = std::move(req.value());
+
+    std::string big(40000, 'x');
+    ec = co_await stream.async_write_headers({
+        {":method", "GET"}, {":path", "/"}, {":scheme", "https"},
+        {":authority", "test.local"}, {"x-big", big},
+    }, true);
+    (void)ec;
+
+    // 等待服务端判定结束并停止 io_context.
+}
+
 BOOST_AUTO_TEST_SUITE(connection_lifecycle)
 
 // 回归测试: 响应以空 DATA + END_STREAM 结束时, 流释放不得早于
@@ -504,6 +567,48 @@ BOOST_AUTO_TEST_CASE(fragmented_headers_padding_priority)
         if (ec) { st.error = "connect: " + ec.message(); ioc.stop(); co_return; }
         co_await run_fragmented_headers_client(std::move(sock), st);
         ioc.stop();
+    }, net::detached);
+
+    ioc.run();
+
+    BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
+    BOOST_CHECK(st.headers_ok);
+    BOOST_CHECK(st.clean_eof);
+}
+
+// 回归: HEADERS 头部块超过帧长上限被拆成 CONTINUATION 时, END_STREAM
+// 必须由首帧 HEADERS 携带 (CONTINUATION 无该标志), 否则对端永远读不到结束.
+BOOST_AUTO_TEST_CASE(large_headers_end_stream_over_continuation)
+{
+    net::io_context ioc(1);
+    connection_test_state st;
+
+    net::ip::tcp::acceptor acceptor(
+        ioc, net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    auto port = acceptor.local_endpoint().port();
+
+    net::steady_timer watchdog(ioc);
+    watchdog.expires_after(10s);
+    watchdog.async_wait([&](boost::system::error_code ec) {
+        if (!ec) { st.error = "test timeout"; ioc.stop(); }
+    });
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        auto sock = co_await acceptor.async_accept(net_awaitable[ec]);
+        if (ec) { st.error = "accept: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_large_headers_server(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        net::ip::tcp::socket sock(ioc);
+        std::vector<net::ip::tcp::endpoint> endpoints{
+            net::ip::tcp::endpoint(net::ip::make_address("127.0.0.1"), port)};
+        co_await net::async_connect(sock, endpoints, net_awaitable[ec]);
+        if (ec) { st.error = "connect: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_large_headers_client(std::move(sock));
     }, net::detached);
 
     ioc.run();

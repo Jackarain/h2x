@@ -149,8 +149,9 @@ namespace h2x {
                 const uint8_t* block = data.data() + 9;
                 size_t offset = 0;
 
-                // 首帧 HEADERS: 不携带 END_HEADERS/END_STREAM (二者由最后的
-                // CONTINUATION 帧携带).
+                // 首帧 HEADERS: 保留 END_STREAM (若本端结束), 但 END_HEADERS
+                // 由最后的 CONTINUATION 帧携带. CONTINUATION 没有 END_STREAM
+                // 标志 (RFC 7540 §6.10), 故不能在末帧替代 HEADERS 传达结束.
                 size_t chunk = max_payload;
                 std::vector<uint8_t> first(9 + chunk);
                 std::memcpy(first.data(), data.data(), 9);
@@ -159,7 +160,6 @@ namespace h2x {
                 first[1] = (chunk >> 8) & 0xFF;
                 first[2] = chunk & 0xFF;
                 first[4] &= ~static_cast<uint8_t>(frame_flag::END_HEADERS);
-                first[4] &= ~static_cast<uint8_t>(frame_flag::END_STREAM);
                 conn_->write_frame_data(std::move(first));
                 offset += chunk;
 
@@ -179,9 +179,6 @@ namespace h2x {
                     cf[8] = stream_id_ & 0xFF;
                     if (is_last) {
                         cf[4] |= static_cast<uint8_t>(frame_flag::END_HEADERS);
-                        if (end_stream) {
-                            cf[4] |= static_cast<uint8_t>(frame_flag::END_STREAM);
-                        }
                     }
                     std::memcpy(cf.data() + 9, block + offset, chunk);
                     conn_->write_frame_data(std::move(cf));
