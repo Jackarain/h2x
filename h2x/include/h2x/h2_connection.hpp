@@ -193,6 +193,11 @@ namespace h2x {
                     co_return;
                 }
 
+                // 立即采用调用方配置: 握手期间派发的流水线帧 (如 SETTINGS 后
+                // 紧跟的 HEADERS) 必须基于本端真实设置处理, 而不是默认值.
+                settings_ = s;
+                dec_dynamic_table_max_ = s.header_table_size;
+
                 // 客户端发送连接前言.
                 if (r == role::client) {
                     co_await net::async_write(next_layer_,
@@ -303,9 +308,6 @@ namespace h2x {
                         co_await handle_frame(sf);
                     }
                 }
-
-                // 更新协商后的配置.
-                settings_ = s;
 
                 // 初始化 pump 缓冲区（持久分配，避免每帧分配）.
                 // 值初始化 (()) 防止帧头读入前被误读时读到未初始化数据.

@@ -835,6 +835,71 @@ static net::awaitable<void> run_zero_concurrency_client(
     co_await conn->async_wait_pump(3s);
 }
 
+
+// 服务端: 以 max_concurrent_streams=0 完成握手. 客户端把请求 HEADERS
+// 紧跟在 SETTINGS 之后流水线发送, 这些帧在握手期间就会被处理.
+static net::awaitable<void> run_pipelined_headers_server(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    using conn_type = connection<net::ip::tcp::socket>;
+    auto conn = std::make_shared<conn_type>(std::move(sock));
+
+    settings s;
+    s.max_concurrent_streams = 0;
+    co_await conn->async_handshake(role::server, s, ec);
+    if (ec) { st.error = "server: handshake: " + ec.message(); co_return; }
+
+    // 等待 pump 把握手期间排队的 RST_STREAM 发出.
+    net::steady_timer timer(co_await net::this_coro::executor);
+    timer.expires_after(300ms);
+    co_await timer.async_wait(net_awaitable[ec]);
+
+    conn->close();
+    co_await conn->async_wait_pump(3s);
+}
+
+// 裸客户端: preface + SETTINGS + 立即流水线 HEADERS.
+static net::awaitable<void> run_pipelined_headers_client(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    co_await net::async_write(sock,
+        net::buffer(global_client_preface, global_client_preface_len), net_awaitable[ec]);
+    if (ec) { st.error = "client: write preface: " + ec.message(); co_return; }
+
+    auto cs = build_settings_frame(false);
+    co_await net::async_write(sock, net::buffer(cs), net_awaitable[ec]);
+
+    auto hf = build_headers_frame(1, {
+        {":method", "GET"}, {":path", "/"}, {":scheme", "https"},
+        {":authority", "test.local"},
+    }, true);
+    co_await net::async_write(sock, net::buffer(hf), net_awaitable[ec]);
+
+    for (int i = 0; i < 8; ++i) {
+        auto f = co_await read_frame(sock);
+        if (f.size() < 9) break;
+        if (f.size() >= 13
+            && f[3] == static_cast<uint8_t>(frame_type::RST_STREAM)) {
+            st.observed_frame_type = f[3];
+            st.observed_error_code = (static_cast<uint32_t>(f[9]) << 24)
+                | (static_cast<uint32_t>(f[10]) << 16)
+                | (static_cast<uint32_t>(f[11]) << 8)
+                | static_cast<uint32_t>(f[12]);
+            break;
+        }
+        if (f[3] == static_cast<uint8_t>(frame_type::SETTINGS)
+            && !(f[4] & static_cast<uint8_t>(frame_flag::FLAG_ACK))) {
+            auto ack = build_settings_frame(true);
+            co_await net::async_write(sock, net::buffer(ack), net_awaitable[ec]);
+        }
+    }
+    sock.close();
+}
+
 BOOST_AUTO_TEST_SUITE(connection_lifecycle)
 
 // 回归测试: 响应以空 DATA + END_STREAM 结束时, 流释放不得早于
@@ -1188,6 +1253,50 @@ BOOST_AUTO_TEST_CASE(peer_max_concurrent_streams_enforced)
     BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
     BOOST_CHECK_EQUAL(st.observed_error_code,
         static_cast<uint32_t>(errc::too_many_streams));
+}
+// 回归: 握手期间收到的流水线帧必须使用调用方传入的 settings, 而不是
+// 默认值; 否则 MAX_CONCURRENT_STREAMS 等限制对该窗口内的流失效.
+BOOST_AUTO_TEST_CASE(pipelined_headers_use_configured_settings)
+{
+    net::io_context ioc(1);
+    connection_test_state st;
+
+    net::ip::tcp::acceptor acceptor(
+        ioc, net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    auto port = acceptor.local_endpoint().port();
+
+    net::steady_timer watchdog(ioc);
+    watchdog.expires_after(10s);
+    watchdog.async_wait([&](boost::system::error_code ec) {
+        if (!ec) { st.error = "test timeout"; ioc.stop(); }
+    });
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        auto sock = co_await acceptor.async_accept(net_awaitable[ec]);
+        if (ec) { st.error = "accept: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_pipelined_headers_server(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        net::ip::tcp::socket sock(ioc);
+        std::vector<net::ip::tcp::endpoint> endpoints{
+            net::ip::tcp::endpoint(net::ip::make_address("127.0.0.1"), port)};
+        co_await net::async_connect(sock, endpoints, net_awaitable[ec]);
+        if (ec) { st.error = "connect: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_pipelined_headers_client(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    ioc.run();
+
+    BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
+    BOOST_CHECK_EQUAL(static_cast<int>(st.observed_frame_type),
+        static_cast<int>(frame_type::RST_STREAM));
+    BOOST_CHECK_EQUAL(st.observed_error_code,
+        static_cast<uint32_t>(http2_error_code::REFUSED_STREAM));
 }
 BOOST_AUTO_TEST_SUITE_END()
 
