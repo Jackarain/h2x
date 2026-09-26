@@ -38,6 +38,7 @@ namespace h2x {
 			frame_size_error = 6,
 			stream_closed = 7,
 			next_layer_not_open = 8,
+			too_many_streams = 9,
 		};
 	}
 
@@ -71,6 +72,8 @@ namespace h2x {
 				return "Stream closed";
 			case errc::next_layer_not_open:
 				return "NextLayer is not open";
+			case errc::too_many_streams:
+				return "Too many streams";
 			default:
 				return "Unknown error";
 			}

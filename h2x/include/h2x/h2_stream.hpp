@@ -479,6 +479,20 @@ namespace h2x {
     {
         boost::system::error_code ec;
 
+        // 不得超出对端 SETTINGS_MAX_CONCURRENT_STREAMS (RFC 7540 §5.1.2).
+        // 已关闭的流不占用配额; 保留流 (PUSH_PROMISE) 不计入发起侧.
+        size_t active = 0;
+        for (auto& [id, sd] : streams_) {
+            if (!sd.is_remote_initiated && !sd.refused &&
+                sd.state != stream_state::closed) {
+                ++active;
+            }
+        }
+        if (active >= peer_max_concurrent_streams_) {
+            ec = make_error_code(errc::too_many_streams);
+            co_return ec;
+        }
+
         // 分配新的流 ID.
         uint32_t new_id = allocate_stream_id();
         if (new_id == 0) {

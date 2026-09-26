@@ -785,6 +785,56 @@ static net::awaitable<void> run_padded_data_client(
     co_await conn->async_wait_pump(3s);
 }
 
+
+// 服务端: 在 SETTINGS 中声明 MAX_CONCURRENT_STREAMS=0.
+static net::awaitable<void> run_zero_concurrency_server(net::ip::tcp::socket sock)
+{
+    boost::system::error_code ec;
+
+    std::vector<uint8_t> preface(24);
+    co_await net::async_read(sock, net::buffer(preface), net_awaitable[ec]);
+    if (ec) co_return;
+
+    if ((co_await read_frame(sock)).empty()) co_return;
+    auto sf = build_settings_entry(
+        static_cast<uint16_t>(settings_id::SETTINGS_MAX_CONCURRENT_STREAMS), 0);
+    co_await net::async_write(sock, net::buffer(sf), net_awaitable[ec]);
+    if (ec) co_return;
+
+    if ((co_await read_frame(sock)).empty()) co_return;
+    auto sa = build_settings_frame(true);
+    co_await net::async_write(sock, net::buffer(sa), net_awaitable[ec]);
+
+    std::vector<uint8_t> ignore(1);
+    co_await net::async_read(sock, net::buffer(ignore), net_awaitable[ec]);
+}
+
+// 客户端: 对端 MAX_CONCURRENT_STREAMS=0 时 async_request 必须失败.
+static net::awaitable<void> run_zero_concurrency_client(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    using conn_type = connection<net::ip::tcp::socket>;
+    auto conn = std::make_shared<conn_type>(std::move(sock));
+
+    settings s;
+    co_await conn->async_handshake(role::client, s, ec);
+    if (ec) { st.error = "client: handshake: " + ec.message(); co_return; }
+
+    auto req = co_await conn->async_request();
+    if (req.has_value()) {
+        st.error = "async_request unexpectedly succeeded with peer limit 0";
+        st.observed_error_code = 0;
+    } else {
+        st.observed_error_code =
+            static_cast<uint32_t>(req.error().value());
+    }
+
+    conn->close();
+    co_await conn->async_wait_pump(3s);
+}
+
 BOOST_AUTO_TEST_SUITE(connection_lifecycle)
 
 // 回归测试: 响应以空 DATA + END_STREAM 结束时, 流释放不得早于
@@ -1097,6 +1147,47 @@ BOOST_AUTO_TEST_CASE(data_flow_control_counts_padding)
         static_cast<int>(frame_type::RST_STREAM));
     BOOST_CHECK_EQUAL(st.observed_error_code,
         static_cast<uint32_t>(http2_error_code::FLOW_CONTROL_ERROR));
+}
+// 回归: 不得超出对端 SETTINGS_MAX_CONCURRENT_STREAMS 发起新流 (RFC 7540 §5.1.2).
+BOOST_AUTO_TEST_CASE(peer_max_concurrent_streams_enforced)
+{
+    net::io_context ioc(1);
+    connection_test_state st;
+
+    net::ip::tcp::acceptor acceptor(
+        ioc, net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    auto port = acceptor.local_endpoint().port();
+
+    net::steady_timer watchdog(ioc);
+    watchdog.expires_after(10s);
+    watchdog.async_wait([&](boost::system::error_code ec) {
+        if (!ec) { st.error = "test timeout"; ioc.stop(); }
+    });
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        auto sock = co_await acceptor.async_accept(net_awaitable[ec]);
+        if (ec) { st.error = "accept: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_zero_concurrency_server(std::move(sock));
+        ioc.stop();
+    }, net::detached);
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        net::ip::tcp::socket sock(ioc);
+        std::vector<net::ip::tcp::endpoint> endpoints{
+            net::ip::tcp::endpoint(net::ip::make_address("127.0.0.1"), port)};
+        co_await net::async_connect(sock, endpoints, net_awaitable[ec]);
+        if (ec) { st.error = "connect: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_zero_concurrency_client(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    ioc.run();
+
+    BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
+    BOOST_CHECK_EQUAL(st.observed_error_code,
+        static_cast<uint32_t>(errc::too_many_streams));
 }
 BOOST_AUTO_TEST_SUITE_END()
 
