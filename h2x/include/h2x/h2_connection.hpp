@@ -1144,9 +1144,14 @@ namespace h2x {
                 // 流级窗口更新.
                 auto it = streams_.find(sid);
                 if (it != streams_.end()) {
+                    // RFC 7540 §6.9.1: 流级窗口超过 2^31-1 属于流错误,
+                    // 只重置该流; 以 GOAWAY 中断整条连接会牵连其它健康流.
                     if (it->second.remote_window + increment > 0x7FFFFFFF) {
-                        co_await send_goaway(0, http2_error_code::FLOW_CONTROL_ERROR);
-                        abort_ = true;
+                        it->second.state = stream_state::closed;
+                        it->second.reset_received = true;
+                        wake_waiter(it->second.read_waiter);
+                        wake_waiter(it->second.write_waiter);
+                        co_await send_rst_stream(sid, http2_error_code::FLOW_CONTROL_ERROR);
                         co_return;
                     }
                     it->second.remote_window += increment;
