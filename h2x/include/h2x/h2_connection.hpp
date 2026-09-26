@@ -756,6 +756,30 @@ namespace h2x {
             auto sid = fc.stream_id();
             auto flags = fc.flags();
 
+            // 部分帧类型对 stream id 有强约束 (RFC 7540 §6): 违反即连接错误.
+            switch (type) {
+            case frame_type::SETTINGS:
+            case frame_type::PING:
+                // SETTINGS/PING 只作用于连接.
+                if (sid != 0) {
+                    co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                    abort_ = true;
+                    co_return;
+                }
+                break;
+            case frame_type::PRIORITY:
+            case frame_type::RST_STREAM:
+                // PRIORITY/RST_STREAM 必须关联到具体流.
+                if (sid == 0) {
+                    co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                    abort_ = true;
+                    co_return;
+                }
+                break;
+            default:
+                break;
+            }
+
             switch (type) {
             case frame_type::DATA:
                 co_await handle_data_frame(fc);

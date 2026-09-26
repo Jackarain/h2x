@@ -1119,6 +1119,73 @@ static net::awaitable<void> run_stream_zero_client(
     co_await conn->async_wait_pump(3s);
 }
 
+
+// 裸服务端: 握手后发送 stream id 非 0 的 SETTINGS (非法).
+static net::awaitable<void> run_settings_nonzero_sid_server(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    std::vector<uint8_t> preface(24);
+    co_await net::async_read(sock, net::buffer(preface), net_awaitable[ec]);
+    if (ec) co_return;
+
+    if ((co_await read_frame(sock)).empty()) co_return;
+    auto sf = build_settings_frame(false);
+    co_await net::async_write(sock, net::buffer(sf), net_awaitable[ec]);
+    if (ec) co_return;
+
+    if ((co_await read_frame(sock)).empty()) co_return;
+    auto sa = build_settings_frame(true);
+    co_await net::async_write(sock, net::buffer(sa), net_awaitable[ec]);
+    if (ec) co_return;
+
+    std::vector<uint8_t> buf(64, 0);
+    settings_frame bad(buf.data(), buf.size(), false);
+    bad.entries_.clear();
+    int total = bad.pack_settings();
+    buf.resize(static_cast<size_t>(total));
+    // pack_settings 会强制 stream id 为 0, 手工篡改为 1 以构造非法帧.
+    buf[5] = 0; buf[6] = 0; buf[7] = 0; buf[8] = 1;
+    co_await net::async_write(sock, net::buffer(buf), net_awaitable[ec]);
+    if (ec) co_return;
+
+    for (int i = 0; i < 4; ++i) {
+        auto f = co_await read_frame(sock);
+        if (f.size() < 17) break;
+        if (f[3] == static_cast<uint8_t>(frame_type::GOAWAY)) {
+            st.observed_frame_type = f[3];
+            st.observed_error_code = (static_cast<uint32_t>(f[13]) << 24)
+                | (static_cast<uint32_t>(f[14]) << 16)
+                | (static_cast<uint32_t>(f[15]) << 8)
+                | static_cast<uint32_t>(f[16]);
+            break;
+        }
+    }
+    sock.close();
+}
+
+// 客户端: 仅完成握手并等待处理非法帧.
+static net::awaitable<void> run_settings_nonzero_sid_client(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    using conn_type = connection<net::ip::tcp::socket>;
+    auto conn = std::make_shared<conn_type>(std::move(sock));
+
+    settings s;
+    co_await conn->async_handshake(role::client, s, ec);
+    if (ec) { st.error = "client: handshake: " + ec.message(); co_return; }
+
+    net::steady_timer timer(co_await net::this_coro::executor);
+    timer.expires_after(300ms);
+    co_await timer.async_wait(net_awaitable[ec]);
+
+    conn->close();
+    co_await conn->async_wait_pump(3s);
+}
+
 BOOST_AUTO_TEST_SUITE(connection_lifecycle)
 
 // 回归测试: 响应以空 DATA + END_STREAM 结束时, 流释放不得早于
@@ -1638,6 +1705,49 @@ BOOST_AUTO_TEST_CASE(headers_on_stream_zero_rejected)
         co_await net::async_connect(sock, endpoints, net_awaitable[ec]);
         if (ec) { st.error = "connect: " + ec.message(); ioc.stop(); co_return; }
         co_await run_stream_zero_client(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    ioc.run();
+
+    BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
+    BOOST_CHECK_EQUAL(static_cast<int>(st.observed_frame_type),
+        static_cast<int>(frame_type::GOAWAY));
+    BOOST_CHECK_EQUAL(st.observed_error_code,
+        static_cast<uint32_t>(http2_error_code::PROTOCOL_ERROR));
+}
+// 回归: SETTINGS 的 stream id 必须为 0 (RFC 7540 §6.5), 否则连接错误.
+BOOST_AUTO_TEST_CASE(settings_nonzero_stream_id_rejected)
+{
+    net::io_context ioc(1);
+    connection_test_state st;
+
+    net::ip::tcp::acceptor acceptor(
+        ioc, net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    auto port = acceptor.local_endpoint().port();
+
+    net::steady_timer watchdog(ioc);
+    watchdog.expires_after(10s);
+    watchdog.async_wait([&](boost::system::error_code ec) {
+        if (!ec) { st.error = "test timeout"; ioc.stop(); }
+    });
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        auto sock = co_await acceptor.async_accept(net_awaitable[ec]);
+        if (ec) { st.error = "accept: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_settings_nonzero_sid_server(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        net::ip::tcp::socket sock(ioc);
+        std::vector<net::ip::tcp::endpoint> endpoints{
+            net::ip::tcp::endpoint(net::ip::make_address("127.0.0.1"), port)};
+        co_await net::async_connect(sock, endpoints, net_awaitable[ec]);
+        if (ec) { st.error = "connect: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_settings_nonzero_sid_client(std::move(sock), st);
         ioc.stop();
     }, net::detached);
 
