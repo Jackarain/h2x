@@ -476,6 +476,59 @@ static net::awaitable<void> run_large_headers_client(
     // 等待服务端判定结束并停止 io_context.
 }
 
+// 构造只含一个设置项的 SETTINGS 帧.
+static std::vector<uint8_t> build_settings_entry(uint16_t id, uint32_t value)
+{
+    std::vector<uint8_t> buf(64, 0);
+    settings_frame sf(buf.data(), buf.size(), false);
+    sf.entries_.clear();
+    sf.entries_.emplace_back(static_cast<settings_id>(id), value);
+    int total = sf.pack_settings();
+    buf.resize(static_cast<size_t>(total));
+    return buf;
+}
+
+// 服务端: 发送 MAX_FRAME_SIZE=0 的非法 SETTINGS.
+static net::awaitable<void> run_bad_settings_server(net::ip::tcp::socket sock)
+{
+    boost::system::error_code ec;
+
+    std::vector<uint8_t> preface(24);
+    co_await net::async_read(sock, net::buffer(preface), net_awaitable[ec]);
+    if (ec) co_return;
+
+    (void)co_await read_frame(sock);   // 客户端 SETTINGS.
+
+    auto bad = build_settings_entry(
+        static_cast<uint16_t>(settings_id::SETTINGS_MAX_FRAME_SIZE), 0);
+    co_await net::async_write(sock, net::buffer(bad), net_awaitable[ec]);
+
+    // 若客户端错误地接受了非法设置, 会回 SETTINGS ACK 并等待本端 ACK;
+    // 这里补发 ACK, 使"未修复"路径能完成握手 (从而暴露问题).
+    (void)co_await read_frame(sock);
+    auto ack = build_settings_frame(true);
+    co_await net::async_write(sock, net::buffer(ack), net_awaitable[ec]);
+}
+
+// 客户端: 非法 SETTINGS 必须导致握手失败.
+static net::awaitable<void> run_bad_settings_client(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    using conn_type = connection<net::ip::tcp::socket>;
+    auto conn = std::make_shared<conn_type>(std::move(sock));
+
+    settings s;
+    co_await conn->async_handshake(role::client, s, ec);
+    if (!ec) {
+        st.error = "handshake unexpectedly succeeded with MAX_FRAME_SIZE=0";
+        conn->close();
+        co_return;
+    }
+    conn->close();
+}
+
 BOOST_AUTO_TEST_SUITE(connection_lifecycle)
 
 // 回归测试: 响应以空 DATA + END_STREAM 结束时, 流释放不得早于
@@ -616,6 +669,46 @@ BOOST_AUTO_TEST_CASE(large_headers_end_stream_over_continuation)
     BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
     BOOST_CHECK(st.headers_ok);
     BOOST_CHECK(st.clean_eof);
+}
+
+// 回归: 对端 SETTINGS_MAX_FRAME_SIZE 非法 (0) 时必须作为连接错误拒绝,
+// 不能被接受 (否则后续发送会因 max_payload=0 空转).
+BOOST_AUTO_TEST_CASE(peer_settings_invalid_max_frame_size)
+{
+    net::io_context ioc(1);
+    connection_test_state st;
+
+    net::ip::tcp::acceptor acceptor(
+        ioc, net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    auto port = acceptor.local_endpoint().port();
+
+    net::steady_timer watchdog(ioc);
+    watchdog.expires_after(10s);
+    watchdog.async_wait([&](boost::system::error_code ec) {
+        if (!ec) { st.error = "test timeout"; ioc.stop(); }
+    });
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        auto sock = co_await acceptor.async_accept(net_awaitable[ec]);
+        if (ec) { st.error = "accept: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_bad_settings_server(std::move(sock));
+    }, net::detached);
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        net::ip::tcp::socket sock(ioc);
+        std::vector<net::ip::tcp::endpoint> endpoints{
+            net::ip::tcp::endpoint(net::ip::make_address("127.0.0.1"), port)};
+        co_await net::async_connect(sock, endpoints, net_awaitable[ec]);
+        if (ec) { st.error = "connect: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_bad_settings_client(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    ioc.run();
+
+    BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

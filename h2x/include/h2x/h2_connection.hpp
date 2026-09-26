@@ -264,8 +264,18 @@ namespace h2x {
                 // 解析对方的连接设置帧, 更新本地配置.
                 sf.entries_.clear();
                 sf.unpack_settings();
-                if (!apply_peer_settings(sf.entries_)) {
-                    ec = make_error_code(errc::flow_control_error);
+                if (auto err = apply_peer_settings(sf.entries_)) {
+                    switch (*err) {
+                    case http2_error_code::FRAME_SIZE_ERROR:
+                        ec = make_error_code(errc::frame_size_error);
+                        break;
+                    case http2_error_code::FLOW_CONTROL_ERROR:
+                        ec = make_error_code(errc::flow_control_error);
+                        break;
+                    default:
+                        ec = make_error_code(errc::protocol_error);
+                        break;
+                    }
                     co_return;
                 }
 
@@ -542,12 +552,20 @@ namespace h2x {
     private:
         // 从对端 SETTINGS 更新本地配置. 返回 false 表示流控窗口越界
         // (RFC 7540 §6.5.2/§6.9.2 连接错误 FLOW_CONTROL_ERROR).
-        bool apply_peer_settings(const std::vector<settings_entry>& entries)
+        // 从对端 SETTINGS 更新本地配置. 返回 std::nullopt 表示应用成功;
+        // 否则返回需要上报的连接错误码 (RFC 7540 §6.5.2).
+        std::optional<http2_error_code>
+        apply_peer_settings(const std::vector<settings_entry>& entries)
         {
             for (auto& e : entries) {
                 switch (static_cast<settings_id>(e.identifier_)) {
                 case settings_id::SETTINGS_HEADER_TABLE_SIZE:
                     peer_header_table_size_ = e.value_;
+                    break;
+                case settings_id::SETTINGS_ENABLE_PUSH:
+                    // 取值只能是 0 或 1.
+                    if (e.value_ > 1)
+                        return http2_error_code::PROTOCOL_ERROR;
                     break;
                 case settings_id::SETTINGS_MAX_CONCURRENT_STREAMS:
                     peer_max_concurrent_streams_ = e.value_;
@@ -556,7 +574,7 @@ namespace h2x {
                 {
                     // 窗口值不得超过 2^31-1 (RFC 7540 §6.5.2).
                     if (e.value_ > 0x7FFFFFFF)
-                        return false;
+                        return http2_error_code::FLOW_CONTROL_ERROR;
 
                     int64_t delta = static_cast<int64_t>(e.value_)
                                   - static_cast<int64_t>(peer_initial_window_size_);
@@ -564,7 +582,7 @@ namespace h2x {
                     for (auto& [id, sd] : streams_) {
                         // 调整后任一流的远端窗口不得超过 2^31-1 (RFC 7540 §6.9.2).
                         if (sd.remote_window + delta > 0x7FFFFFFF)
-                            return false;
+                            return http2_error_code::FLOW_CONTROL_ERROR;
                         sd.remote_window += delta;
                         // 窗口增大后必须唤醒等待发送的写入者; 否则发送协程
                         // 即使窗口已恢复也会永久挂起.
@@ -573,13 +591,16 @@ namespace h2x {
                     break;
                 }
                 case settings_id::SETTINGS_MAX_FRAME_SIZE:
+                    // 取值范围 [2^14, 2^24-1] (RFC 7540 §6.5.2).
+                    if (e.value_ < 16384 || e.value_ > 0xFFFFFF)
+                        return http2_error_code::FRAME_SIZE_ERROR;
                     peer_max_frame_size_ = e.value_;
                     break;
                 default:
                     break;
                 }
             }
-            return true;
+            return std::nullopt;
         }
 
         // 分配流 ID：客户端使用奇数，服务端使用偶数.
@@ -1017,10 +1038,9 @@ namespace h2x {
                 co_return;
             }
 
-            // 更新对端设置.
-            if (!apply_peer_settings(sf.entries_)) {
-                // 流控窗口越界 → 连接错误.
-                co_await send_goaway(0, http2_error_code::FLOW_CONTROL_ERROR);
+            // 更新对端设置. 取值非法时使用对应错误码上报连接错误.
+            if (auto err = apply_peer_settings(sf.entries_)) {
+                co_await send_goaway(0, *err);
                 abort_ = true;
                 co_return;
             }
