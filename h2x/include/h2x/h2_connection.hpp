@@ -799,6 +799,14 @@ namespace h2x {
         net::awaitable<void> handle_data_frame(frame_codec& fc)
         {
             auto sid = fc.stream_id();
+
+            // DATA 的流标识符不得为 0 (RFC 7540 §6.1): 连接错误.
+            if (sid == 0) {
+                co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                abort_ = true;
+                co_return;
+            }
+
             data_frame df(fc.data_, fc.size_);
             // 流控按整个 DATA 负载计量, 含 Pad Length 与 Padding 字段
             // (RFC 7540 §6.9.1); 仅剔除 padding 会让对端用 padding 绕过窗口.
@@ -872,6 +880,14 @@ namespace h2x {
         net::awaitable<void> handle_headers_frame(frame_codec& fc)
         {
             auto sid = fc.stream_id();
+
+            // HEADERS 的流标识符不得为 0 (RFC 7540 §6.2): 连接错误.
+            if (sid == 0) {
+                co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                abort_ = true;
+                co_return;
+            }
+
             auto it = streams_.find(sid);
 
             // 如果是新流 ID（服务端收到客户端请求）.
@@ -880,9 +896,10 @@ namespace h2x {
                 // - 服务端只能收到客户端发起的奇数流 ID
                 // - 客户端只能收到服务端发起的偶数流 ID (推送流)
                 if ((role_ == role::server && sid % 2 == 0) ||
-                    (role_ == role::client && sid % 2 == 1 && sid != 0)) {
-                    // 违反 HTTP/2 协议，发送 GOAWAY PROTOCOL_ERROR
+                    (role_ == role::client && sid % 2 == 1)) {
+                    // 违反 HTTP/2 协议, 连接错误 PROTOCOL_ERROR 后终止连接.
                     co_await send_goaway(sid, http2_error_code::PROTOCOL_ERROR);
+                    abort_ = true;
                     co_return;
                 }
 
