@@ -658,6 +658,7 @@ namespace h2x {
             bool reset_received = false;
             bool pending_end_stream = false;  // 暂存分片 HEADERS 的 END_STREAM 标志.
             bool headers_in_progress = false; // 分片 HEADERS (END_HEADERS 未置位) 是否在途.
+            bool refused = false;             // 超过并发上限; 仅用于解码 HPACK 后拒绝.
 
             // 流控窗口.
             int64_t local_window = 65535;
@@ -891,19 +892,24 @@ namespace h2x {
                         ++active;
                     }
                 }
-                if (active >= settings_.max_concurrent_streams) {
-                    co_await send_rst_stream(sid, http2_error_code::REFUSED_STREAM);
-                    co_return;
-                }
+                const bool refused =
+                    active >= settings_.max_concurrent_streams;
 
+                // 即使要拒绝该流, 也必须先解码其头部块, 以维持连接级 HPACK
+                // 动态表状态 (RFC 7540 §4.3); 故先登记流状态承载解码, 稍后拒绝.
                 auto [new_it, ok] = streams_.emplace(sid, stream_state_data{});
                 if (!ok) co_return;
                 it = new_it;
                 it->second.stream_id = sid;
-                it->second.state = stream_state::idle;  // 等待 async_accept 拾取
-                it->second.is_remote_initiated = true;
-                it->second.local_window = settings_.initial_window_size;
-                it->second.remote_window = peer_initial_window_size_;
+                if (refused) {
+                    it->second.refused = true;
+                    it->second.state = stream_state::closed;
+                } else {
+                    it->second.state = stream_state::idle;  // 等待 async_accept 拾取
+                    it->second.is_remote_initiated = true;
+                    it->second.local_window = settings_.initial_window_size;
+                    it->second.remote_window = peer_initial_window_size_;
+                }
             }
 
             auto& sd = it->second;
@@ -933,6 +939,14 @@ namespace h2x {
                         add_to_dynamic_table(h);
                     }
                     sd.headers.emplace_back(h);
+                }
+
+                // 头部块已解码 (动态表已同步), 此时再拒绝超限的新流.
+                if (sd.refused) {
+                    sd.headers.clear();
+                    co_await send_rst_stream(sid, http2_error_code::REFUSED_STREAM);
+                    streams_.erase(sid);
+                    co_return;
                 }
 
                 if (hf.end_stream_) {
@@ -1210,6 +1224,16 @@ namespace h2x {
                 if (hpack_error) {
                     co_await send_goaway(sid, http2_error_code::COMPRESSION_ERROR);
                     abort_ = true;
+                    co_return;
+                }
+
+                // 头部块已解码 (动态表已同步), 此时再拒绝超限的新流.
+                if (sd.refused) {
+                    sd.headers.clear();
+                    sd.pending_header_block.clear();
+                    sd.headers_in_progress = false;
+                    co_await send_rst_stream(sid, http2_error_code::REFUSED_STREAM);
+                    streams_.erase(sid);
                     co_return;
                 }
 
