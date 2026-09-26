@@ -467,6 +467,20 @@ namespace h2x {
         }
     }
 
+    // 缩小动态表上限时按需驱逐最旧条目 (RFC 7541 §4.3).
+    inline void hpack_dynamic_table_shrink(std::vector<header_entry>& table,
+                                           size_t& table_size, size_t max_size)
+    {
+        while (table_size > max_size && !table.empty()) {
+            auto& old = table.back();
+            size_t old_size = 32;
+            if (old.name_) old_size += old.name_->size();
+            if (old.value_) old_size += old.value_->size();
+            table_size -= old_size;
+            table.pop_back();
+        }
+    }
+
     ////////////////////////////////////////////////////////////////////////////////
 
     /**
@@ -787,12 +801,16 @@ namespace h2x {
 
         // 设置解码方向的动态表上下文; 设置后 unpack 过程中会就地维护表状态,
         // 使同一头部块内后续字段能引用到刚加入的表项 (RFC 7541 §6.2.1).
+        // table_max 指向当前生效上限 (可被 size update 调整), limit 为本端
+        // SETTINGS_HEADER_TABLE_SIZE 声明上限 (size update 不得超过).
         void set_decoder_table(std::vector<header_entry>* table, size_t* table_size,
-                               size_t max_size)
+                               size_t* table_max, size_t limit)
         {
             dec_table_ = table;
             dec_table_size_ = table_size;
-            dec_table_max_ = max_size;
+            dec_table_max_ = table_max;
+            dec_table_limit_ = limit;
+            dec_saw_field_ = false;
         }
 
         // 提取 flag 解析逻辑
@@ -1079,6 +1097,7 @@ namespace h2x {
             entry.type_ = op;
 
             headers_.push_back(entry);
+            dec_saw_field_ = true;
             return nbytes;
         }
 
@@ -1091,7 +1110,25 @@ namespace h2x {
                 throw std::runtime_error("headers_frame: invalid integer");
             }
 
+            // size update 必须出现在头部块开头 (RFC 7541 §4.2).
+            if (dec_table_ && dec_saw_field_) {
+                throw std::runtime_error(
+                    "headers_frame: dynamic table size update not at block start");
+            }
+
+            // 新上限不得超过本端 SETTINGS_HEADER_TABLE_SIZE (RFC 7541 §6.3).
+            if (dec_table_ && length > dec_table_limit_) {
+                throw std::runtime_error(
+                    "headers_frame: dynamic table size update exceeds limit");
+            }
+
             dynamic_table_size_update_.emplace(length);
+
+            if (dec_table_) {
+                *dec_table_max_ = static_cast<size_t>(length);
+                hpack_dynamic_table_shrink(*dec_table_, *dec_table_size_,
+                    static_cast<size_t>(length));
+            }
             return nbytes;
         }
 
@@ -1159,8 +1196,9 @@ namespace h2x {
             // 内后续字段可引用它 (RFC 7541 §6.2.1).
             if (dec_table_ && op->type_ == operation_type::LITERALINCREMENTALINDEXING) {
                 hpack_dynamic_table_add(*dec_table_, nullptr, *dec_table_size_,
-                    headers_.back(), dec_table_max_);
+                    headers_.back(), *dec_table_max_);
             }
+            dec_saw_field_ = true;
 
             return nbytes;
         }
@@ -1207,7 +1245,9 @@ namespace h2x {
         // 解码方向动态表上下文 (可选): 解析时就地维护表状态.
         std::vector<header_entry>* dec_table_ = nullptr;
         size_t* dec_table_size_ = nullptr;
-        size_t dec_table_max_ = 4096;
+        size_t* dec_table_max_ = nullptr;   // 当前生效上限.
+        size_t dec_table_limit_ = 4096;     // size update 允许的最大值.
+        bool dec_saw_field_ = false;        // 本头部块是否已出现字段.
 
         bool end_stream_ = false;
         bool end_headers_ = false;

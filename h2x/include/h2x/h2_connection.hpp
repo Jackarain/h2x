@@ -918,7 +918,7 @@ namespace h2x {
             hf.parse_flags();
             // 解码方向动态表上下文: 解析过程中就地加入增量索引表项.
             hf.set_decoder_table(&dec_dynamic_table_, &dec_dynamic_table_size_,
-                settings_.header_table_size);
+                &dec_dynamic_table_max_, settings_.header_table_size);
 
             if (hf.end_headers_) {
                 // 完整头部块到达 — 执行完整 HPACK 解析.
@@ -1210,7 +1210,7 @@ namespace h2x {
                 try {
                     headers_frame cont_hf(tmp.data(), tmp.size(), false, &dec_dynamic_table_);
                     cont_hf.set_decoder_table(&dec_dynamic_table_, &dec_dynamic_table_size_,
-                        settings_.header_table_size);
+                        &dec_dynamic_table_max_, settings_.header_table_size);
                     cont_hf.unpack_headers();
 
                     for (auto& h : cont_hf.headers_) {
@@ -1426,6 +1426,7 @@ namespace h2x {
         // 解码方向动态表 (对端编码器写入), 上限为本端 SETTINGS_HEADER_TABLE_SIZE.
         std::vector<header_entry> dec_dynamic_table_;
         size_t dec_dynamic_table_size_ = 0;
+        size_t dec_dynamic_table_max_ = 4096;  // 当前生效上限 (可被 size update 调整).
 
         // 编码方向动态表 (本端编码器写入), 上限为对端 SETTINGS_HEADER_TABLE_SIZE.
         std::vector<header_entry> enc_dynamic_table_;

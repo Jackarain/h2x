@@ -611,4 +611,96 @@ BOOST_AUTO_TEST_CASE(pack_headers_overflow_returns_error)
 
 BOOST_AUTO_TEST_SUITE_END()
 
+// ──────────────────────────────────────────────────────────────────────────────
+// 解码方向动态表大小更新 (RFC 7541 §4.2/§6.3)
+// ──────────────────────────────────────────────────────────────────────────────
+
+BOOST_AUTO_TEST_SUITE(hpack_dynamic_table_size_update_decode)
+
+// 组装一个仅含 header block 的 HEADERS 帧 (END_HEADERS).
+static void build_headers_from_block(const std::vector<uint8_t>& block,
+                                     std::vector<uint8_t>& out)
+{
+    out.assign(9 + block.size(), 0);
+    out[3] = static_cast<uint8_t>(frame_type::HEADERS);
+    out[4] = static_cast<uint8_t>(frame_flag::END_HEADERS);
+    out[0] = (block.size() >> 16) & 0xFF;
+    out[1] = (block.size() >> 8) & 0xFF;
+    out[2] = block.size() & 0xFF;
+    std::memcpy(out.data() + 9, block.data(), block.size());
+}
+
+static header_entry make_entry(const std::string& name, const std::string& value)
+{
+    header_entry e{0, name, value, 0, &G_LITERAL_INCREMENTAL_INDEXING};
+    e.hash_ = frame_header_hash(e);
+    return e;
+}
+
+BOOST_AUTO_TEST_CASE(size_update_shrinks_existing_table)
+{
+    // 预置两条表项 (各 36 字节): 索引 62 = "x-b", 63 = "x-a".
+    std::vector<header_entry> table;
+    table.push_back(make_entry("x-b", "2"));
+    table.push_back(make_entry("x-a", "1"));
+    size_t table_size = 72;
+    size_t table_max = 4096;
+
+    // size update 到 36: 必须驱逐最旧的一条, 只保留 "x-b".
+    std::vector<uint8_t> block;
+    auto packed = hpack_pack_integer(36, 5);
+    packed[0] |= 0x20;
+    block.insert(block.end(), packed.begin(), packed.end());
+
+    std::vector<uint8_t> frame;
+    build_headers_from_block(block, frame);
+
+    headers_frame hf(frame.data(), frame.size(), false, &table);
+    hf.set_decoder_table(&table, &table_size, &table_max, 4096);
+    hf.unpack_headers();
+
+    BOOST_REQUIRE_EQUAL(table.size(), 1u);
+    BOOST_CHECK_EQUAL(table_size, 36u);
+    BOOST_CHECK_EQUAL(table[0].name_.value_or(""), "x-b");
+}
+
+BOOST_AUTO_TEST_CASE(size_update_exceeds_limit_throws)
+{
+    std::vector<header_entry> table;
+    size_t table_size = 0;
+    size_t table_max = 100;
+
+    // size update 到 128, 但本端声明上限为 100 → 解码错误.
+    std::vector<uint8_t> block;
+    auto packed = hpack_pack_integer(128, 5);
+    packed[0] |= 0x20;
+    block.insert(block.end(), packed.begin(), packed.end());
+
+    std::vector<uint8_t> frame;
+    build_headers_from_block(block, frame);
+
+    headers_frame hf(frame.data(), frame.size(), false, &table);
+    hf.set_decoder_table(&table, &table_size, &table_max, 100);
+    BOOST_CHECK_THROW(hf.unpack_headers(), std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(size_update_after_field_throws)
+{
+    std::vector<header_entry> table;
+    size_t table_size = 0;
+    size_t table_max = 4096;
+
+    // 先解析一个字段 (0x88 = :status 200), 之后再出现 size update 属非法.
+    std::vector<uint8_t> block = { 0x88, 0x20 };
+
+    std::vector<uint8_t> frame;
+    build_headers_from_block(block, frame);
+
+    headers_frame hf(frame.data(), frame.size(), false, &table);
+    hf.set_decoder_table(&table, &table_size, &table_max, 4096);
+    BOOST_CHECK_THROW(hf.unpack_headers(), std::runtime_error);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
 } // namespace h2x
