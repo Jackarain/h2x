@@ -1335,6 +1335,26 @@ namespace h2x {
                 co_return;
             }
 
+            // 关联流必须是本端发起的流 (客户端为奇数), 且不能处于 idle;
+            // 并且只允许 open / half-closed(local) 状态 (RFC 9113 §5.1/§6.6).
+            const uint32_t sid = fc.stream_id();
+            const bool local_initiated = (role_ == role::client)
+                ? (sid % 2 == 1) : (sid % 2 == 0);
+            if (!local_initiated || is_idle_stream(sid)) {
+                co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                abort_ = true;
+                co_return;
+            }
+            if (auto sit = streams_.find(sid); sit != streams_.end()) {
+                const auto state = sit->second.state;
+                if (state != stream_state::open &&
+                    state != stream_state::half_closed_local) {
+                    co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                    abort_ = true;
+                    co_return;
+                }
+            }
+
             // promised stream id 必须是合法的下一个对端流标识符
             // (偶数且严格递增, RFC 9113 §5.1.1/§6.6).
             if (promised_id == 0 || promised_id % 2 != 0 ||

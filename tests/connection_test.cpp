@@ -3000,6 +3000,155 @@ BOOST_AUTO_TEST_CASE(goaway_nonzero_stream_id_rejected)
         http2_error_code::PROTOCOL_ERROR);
 }
 
+// 构建 PUSH_PROMISE 帧 (END_HEADERS, 无 padding).
+static std::vector<uint8_t> build_push_promise_frame(
+    uint32_t sid, uint32_t promised, const uint8_t* block, size_t block_len)
+{
+    std::vector<uint8_t> payload(4 + block_len, 0);
+    payload[0] = (promised >> 24) & 0x7F;
+    payload[1] = (promised >> 16) & 0xFF;
+    payload[2] = (promised >> 8) & 0xFF;
+    payload[3] = promised & 0xFF;
+    if (block_len) {
+        std::memcpy(payload.data() + 4, block, block_len);
+    }
+    return build_raw_frame(sid, static_cast<uint8_t>(frame_type::PUSH_PROMISE),
+        static_cast<uint8_t>(frame_flag::END_HEADERS),
+        payload.data(), payload.size());
+}
+
+// 启用推送的客户端: 握手后发出带 END_STREAM 的请求, 随后短暂等待.
+static net::awaitable<void> run_push_reject_client(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    using conn_type = connection<net::ip::tcp::socket>;
+    auto conn = std::make_shared<conn_type>(std::move(sock));
+
+    settings s;
+    s.enable_push = true;
+    co_await conn->async_handshake(role::client, s, ec);
+    if (ec) { st.error = "client: handshake: " + ec.message(); co_return; }
+
+    auto req = co_await conn->async_request();
+    if (!req.has_value()) { st.error = "client: async_request failed"; co_return; }
+    auto stream = std::move(req.value());
+    ec = co_await stream.async_write_headers({
+        {":method", "GET"}, {":path", "/"}, {":scheme", "https"},
+        {":authority", "test.local"},
+    }, true);
+    if (ec) { st.error = "client: write headers: " + ec.message(); co_return; }
+
+    net::steady_timer timer(co_await net::this_coro::executor);
+    timer.expires_after(300ms);
+    co_await timer.async_wait(net_awaitable[ec]);
+
+    conn->close();
+    co_await conn->async_wait_pump(3s);
+}
+
+// 服务端: 握手并读到请求后, 依次发送 frames, 然后尝试读取客户端的 GOAWAY.
+static net::awaitable<void> run_push_reject_server(
+    net::ip::tcp::socket sock, connection_test_state& st,
+    std::vector<std::vector<uint8_t>> frames)
+{
+    boost::system::error_code ec;
+
+    std::vector<uint8_t> preface(24);
+    co_await net::async_read(sock, net::buffer(preface), net_awaitable[ec]);
+    if (ec) { st.error = "server: read preface: " + ec.message(); co_return; }
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no settings"; co_return; }
+    auto sf = build_settings_frame(false);
+    co_await net::async_write(sock, net::buffer(sf), net_awaitable[ec]);
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no settings ack"; co_return; }
+    auto sa = build_settings_frame(true);
+    co_await net::async_write(sock, net::buffer(sa), net_awaitable[ec]);
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no request"; co_return; }
+
+    for (auto& f : frames) {
+        co_await net::async_write(sock, net::buffer(f), net_awaitable[ec]);
+        if (ec) { st.error = "server: write frame: " + ec.message(); co_return; }
+    }
+
+    for (int i = 0; i < 6; ++i) {
+        auto f = co_await read_frame(sock);
+        if (f.size() < 9) break;
+        if (f[3] == static_cast<uint8_t>(frame_type::GOAWAY) && f.size() >= 17) {
+            st.observed_frame_type = f[3];
+            st.observed_error_code = (static_cast<uint32_t>(f[13]) << 24)
+                | (static_cast<uint32_t>(f[14]) << 16)
+                | (static_cast<uint32_t>(f[15]) << 8) | f[16];
+            break;
+        }
+    }
+    sock.close();
+}
+
+static void run_push_reject_case(std::vector<std::vector<uint8_t>> frames,
+                                 http2_error_code expected)
+{
+    net::io_context ioc(1);
+    connection_test_state st;
+
+    net::ip::tcp::acceptor acceptor(
+        ioc, net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    auto port = acceptor.local_endpoint().port();
+
+    net::steady_timer watchdog(ioc);
+    watchdog.expires_after(10s);
+    watchdog.async_wait([&](boost::system::error_code ec) {
+        if (!ec) { st.error = "test timeout"; ioc.stop(); }
+    });
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        auto sock = co_await acceptor.async_accept(net_awaitable[ec]);
+        if (ec) { st.error = "accept: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_push_reject_server(std::move(sock), st, std::move(frames));
+        ioc.stop();
+    }, net::detached);
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        net::ip::tcp::socket sock(ioc);
+        std::vector<net::ip::tcp::endpoint> endpoints{
+            net::ip::tcp::endpoint(net::ip::make_address("127.0.0.1"), port)};
+        co_await net::async_connect(sock, endpoints, net_awaitable[ec]);
+        if (ec) { st.error = "connect: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_push_reject_client(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    ioc.run();
+
+    BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
+    BOOST_CHECK_EQUAL(static_cast<int>(st.observed_frame_type),
+        static_cast<int>(frame_type::GOAWAY));
+    BOOST_CHECK_EQUAL(st.observed_error_code, static_cast<uint32_t>(expected));
+}
+
+// 回归: PUSH_PROMISE 必须关联到本端发起且在用的流. 关联到 idle 流 (stream 3)
+// 属连接错误 PROTOCOL_ERROR (RFC 9113 §5.1/§6.6).
+BOOST_AUTO_TEST_CASE(push_promise_on_idle_associated_stream_rejected)
+{
+    uint8_t block[1] = {0x82};  // 合法 HPACK: :method: GET
+    run_push_reject_case(
+        {build_push_promise_frame(3, 2, block, sizeof(block))},
+        http2_error_code::PROTOCOL_ERROR);
+}
+
+// 回归: PUSH_PROMISE 不能关联到对端发起的流 (偶数 stream 2): 先合法承诺
+// stream 2, 再在 stream 2 上发 PUSH_PROMISE, 属连接错误 PROTOCOL_ERROR.
+BOOST_AUTO_TEST_CASE(push_promise_on_peer_initiated_stream_rejected)
+{
+    uint8_t block[1] = {0x82};
+    run_push_reject_case(
+        {build_push_promise_frame(1, 2, block, sizeof(block)),
+         build_push_promise_frame(2, 4, block, sizeof(block))},
+        http2_error_code::PROTOCOL_ERROR);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace h2x
