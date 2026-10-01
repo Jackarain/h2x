@@ -41,7 +41,7 @@ endif()
 
 # --- helper: define a fuzz executable ---
 function(add_h2x_fuzz TARGET SOURCE)
-    add_executable(${TARGET} ${SOURCE})
+    add_executable(${TARGET} ${SOURCE} ${ARGN})
 
     target_include_directories(${TARGET} PRIVATE
         ${H2X_SOURCE_DIR}/h2x/include
@@ -73,3 +73,11 @@ add_h2x_fuzz(fuzz_frames fuzz_frames.cc)
 # fuzz_hpack — targeted HPACK integer / string / Huffman decoder
 # -------------------------------------------------------------------
 add_h2x_fuzz(fuzz_hpack fuzz_hpack.cc)
+
+# -------------------------------------------------------------------
+# fuzz_connection — connection/session level state machine, feeds the
+# peer side of a real socket pair (mirrors nghttp2's fuzz_target.cc)
+# -------------------------------------------------------------------
+add_h2x_fuzz(fuzz_connection fuzz_connection.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../example/lib_asio.cpp)
+target_link_libraries(fuzz_connection PRIVATE Boost::asio Boost::system)

@@ -9,6 +9,7 @@
 |----------------|-------------------------------------------------------|
 | `fuzz_frames`  | 所有 HTTP/2 帧解析器 + HPACK 自由函数                  |
 | `fuzz_hpack`   | HPACK 整数/字符串/Huffman 解码例程                     |
+| `fuzz_connection` | 连接/会话级状态机（握手、SETTINGS、流生命周期、流控） |
 
 ## 前置依赖
 
@@ -23,11 +24,11 @@ mkdir build/fuzz && cd build/fuzz
 
 # libFuzzer 模式（Linux/Clang）
 cmake -DCMAKE_CXX_COMPILER=clang++ -DENABLE_BUILD_FUZZ=ON ../..
-make fuzz_frames fuzz_hpack -j$(nproc)
+make fuzz_frames fuzz_hpack fuzz_connection -j$(nproc)
 
 # 独立模式（macOS/任意编译器，无需 libFuzzer）
 cmake -DCMAKE_CXX_COMPILER=clang++ -DENABLE_BUILD_FUZZ=ON -DSTANDALONE_FUZZER=ON ../..
-make fuzz_frames fuzz_hpack -j$(nproc)
+make fuzz_frames fuzz_hpack fuzz_connection -j$(nproc)
 ```
 
 带 ASan + UBSan：
@@ -37,7 +38,7 @@ cmake -DCMAKE_CXX_COMPILER=clang++ \
       -DENABLE_BUILD_FUZZ=ON \
       -DCMAKE_CXX_FLAGS="-fsanitize=fuzzer-no-link,address,undefined" \
       ../..
-make fuzz_frames fuzz_hpack -j$(nproc)
+make fuzz_frames fuzz_hpack fuzz_connection -j$(nproc)
 ```
 
 ## 运行
@@ -49,10 +50,12 @@ python3 fuzz/generate_corpus.py
 # libFuzzer 模式（持续 fuzz）
 ./bin/fuzz_frames -max_len=16384 -jobs=4 fuzz/corpora/fuzz_frames
 ./bin/fuzz_hpack  -max_len=4096  -jobs=4 fuzz/corpora/fuzz_hpack
+./bin/fuzz_connection -max_len=16384 -jobs=4 fuzz/corpora/fuzz_connection
 
 # 独立模式（回放语料库）
 ./bin/fuzz_frames fuzz/corpora/fuzz_frames
 ./bin/fuzz_hpack  fuzz/corpora/fuzz_hpack
+./bin/fuzz_connection fuzz/corpora/fuzz_connection
 ```
 
 ### 常用 libFuzzer 参数
@@ -75,7 +78,13 @@ python3 fuzz/generate_corpus.py
    直接暴露给 fuzzer — 这些函数通过返回码（-1）而非异常来报告错误，因此特别适合
    覆盖率引导的 fuzz 来触及溢出保护和截断边界等极限情况。
 
-3. **种子语料库**：提供了有效的 HTTP/2 帧和 HPACK 数据结构，帮助 fuzzer 快速发现
+3. **连接/会话**：`fuzz_connection` 把一个真实的 socket pair 的一端交给 h2x
+   连接对象，另一端把 fuzz 字节作为对端报文注入，从而驱动握手、SETTINGS 协商、
+   帧分发、流生命周期、HPACK 编解码和流控等完整状态机（对应 nghttp2 的
+   `fuzz/fuzz_target.cc`）。注入数据可能触发协议错误，但连接会以 GOAWAY/关闭
+   收敛，异常与超时均被吞掉。
+
+4. **种子语料库**：提供了有效的 HTTP/2 帧和 HPACK 数据结构，帮助 fuzzer 快速发现
    有意义的代码路径。
 
 所有帧构造器抛出的异常都会被捕获 — 解析失败是预期行为，不是崩溃。

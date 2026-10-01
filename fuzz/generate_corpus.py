@@ -12,6 +12,7 @@ import struct
 CORPORA_DIR = os.path.join(os.path.dirname(__file__), "corpora")
 FRAMES_DIR = os.path.join(CORPORA_DIR, "fuzz_frames")
 HPACK_DIR = os.path.join(CORPORA_DIR, "fuzz_hpack")
+CONN_DIR = os.path.join(CORPORA_DIR, "fuzz_connection")
 
 
 def ensure_dir(path):
@@ -336,12 +337,68 @@ def generate_hpack_seeds():
 
 
 # -------------------------------------------------------------------
+#  Generate connection-level seeds
+# -------------------------------------------------------------------
+
+CLIENT_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+
+def generate_connection_seeds():
+    """种子格式: 第 0 字节选择 harness 模式, 第 1 字节高位选择 h2x 端角色,
+    其余字节作为对端报文注入 (详见 fuzz/fuzz_connection.cc)."""
+    ensure_dir(CONN_DIR)
+
+    server_handshake = (settings_frame([(0x03, 100), (0x04, 65535)]) +
+                        settings_frame([], ack=True))
+
+    # h2x 作为客户端 (as_client=1), 模式 0: 对端服务器握手 + 响应.
+    write_bin(os.path.join(CONN_DIR, "client_server_handshake"),
+              bytes([0x00, 0x80]) + server_handshake)
+
+    write_bin(os.path.join(CONN_DIR, "client_goaway"),
+              bytes([0x00, 0x80]) + server_handshake +
+              goaway_frame(1, 0, b"bye"))
+
+    write_bin(os.path.join(CONN_DIR, "client_ping_and_rst"),
+              bytes([0x00, 0x80]) + server_handshake +
+              ping_frame(b"12345678") +
+              rst_stream_frame(1, 0x08))
+
+    # h2x 作为服务端 (as_client=0), 模式 0: 完整客户端请求.
+    write_bin(os.path.join(CONN_DIR, "server_client_request"),
+              bytes([0x00, 0x00]) + CLIENT_PREFACE +
+              settings_frame([(0x02, 0), (0x04, 65535)]) +
+              settings_frame([], ack=True) +
+              headers_frame(1, 0x05) +
+              data_frame(1, b"", end_stream=True))
+
+    # 模式 1/2: harness 自行合成握手, 其余字节作为尾部注入.
+    write_bin(os.path.join(CONN_DIR, "synth_tail_frames"),
+              bytes([0x01, 0x80]) +
+              headers_frame(1, 0x04) +
+              data_frame(1, b"hello", end_stream=True) +
+              window_update_frame(0, 1024))
+
+    write_bin(os.path.join(CONN_DIR, "synth_bad_settings"),
+              bytes([0x02, 0x00]) +
+              settings_frame([(0x04, 0xFFFFFFFF), (0x05, 1), (0xA0, 7)]))
+
+    write_bin(os.path.join(CONN_DIR, "synth_continuation"),
+              bytes([0x02, 0x80]) +
+              headers_frame(1, 0x01) +
+              frame_header(0x9, 0x04, 1, 0))  # CONTINUATION END_HEADERS
+
+    print(f"Generated {len(os.listdir(CONN_DIR))} connection seeds in {CONN_DIR}")
+
+
+# -------------------------------------------------------------------
 #  Main
 # -------------------------------------------------------------------
 
 def main():
     generate_frame_seeds()
     generate_hpack_seeds()
+    generate_connection_seeds()
 
 
 if __name__ == "__main__":
