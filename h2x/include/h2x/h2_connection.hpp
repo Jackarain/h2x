@@ -1364,6 +1364,41 @@ namespace h2x {
                 co_return;
             }
 
+            // PUSH_PROMISE 携带的头部块会修改连接级 HPACK 动态表; 即使应用
+            // 不消费推送也必须解码, 否则后续 HEADERS 解码会失步
+            // (RFC 9113 §4.3/§6.6).
+            const auto& frag = ppf.get_header_block_fragment();
+            if (!frag.empty()) {
+                std::vector<uint8_t> tmp(frag.size() + 9, 0);
+                tmp[3] = static_cast<uint8_t>(frame_type::HEADERS);
+                tmp[4] = static_cast<uint8_t>(frame_flag::END_HEADERS);
+                tmp[0] = (frag.size() >> 16) & 0xFF;
+                tmp[1] = (frag.size() >> 8) & 0xFF;
+                tmp[2] = frag.size() & 0xFF;
+                tmp[5] = (sid >> 24) & 0xFF;
+                tmp[6] = (sid >> 16) & 0xFF;
+                tmp[7] = (sid >> 8) & 0xFF;
+                tmp[8] = sid & 0xFF;
+                std::memcpy(tmp.data() + 9, frag.data(), frag.size());
+
+                bool hpack_error = false;
+                try {
+                    headers_frame hf(tmp.data(), tmp.size(), false,
+                        &dec_dynamic_table_);
+                    hf.set_decoder_table(&dec_dynamic_table_,
+                        &dec_dynamic_table_size_, &dec_dynamic_table_max_,
+                        settings_.header_table_size);
+                    hf.unpack_headers();
+                } catch (const std::exception&) {
+                    hpack_error = true;
+                }
+                if (hpack_error) {
+                    co_await send_goaway(sid, http2_error_code::COMPRESSION_ERROR);
+                    abort_ = true;
+                    co_return;
+                }
+            }
+
             // 创建预留流.
             auto [it, ok] = streams_.emplace(promised_id, stream_state_data{});
             if (ok) {
