@@ -303,6 +303,12 @@ namespace h2x {
                     }
                     if (sf.type() == frame_type::SETTINGS &&
                         (sf.flags() & static_cast<uint8_t>(frame_flag::FLAG_ACK))) {
+                        // SETTINGS ACK 不得携带 payload (RFC 9113 §6.5).
+                        if (sf.payload_size() != 0) {
+                            co_await async_write_goaway(0, http2_error_code::FRAME_SIZE_ERROR);
+                            ec = make_error_code(errc::frame_size_error);
+                            co_return;
+                        }
                         got_ack = true;
                     } else {
                         co_await handle_frame(sf);
@@ -435,6 +441,24 @@ namespace h2x {
             co_await net::async_write(next_layer_,
                 net::buffer(fc.data_, total), net_awaitable[ec]);
             co_return total;
+        }
+
+        // 握手期间 pump 尚未启动, out_queue_ 不会被冲刷; 需要上报连接错误时
+        // 直接写一个 GOAWAY 帧到对端.
+        net::awaitable<void> async_write_goaway(uint32_t last_sid, http2_error_code code)
+        {
+            std::vector<uint8_t> buf(64, 0);
+            goaway_frame f(buf.data(), buf.size(), false);
+            f.stream_id(0);
+            f.type(frame_type::GOAWAY);
+            f.set_last_stream_id(last_sid);
+            f.set_error_code(code);
+            f.pack_payload();
+            buf.resize(f.frame_size());
+
+            boost::system::error_code ignored;
+            co_await net::async_write(next_layer_, net::buffer(buf), net_awaitable[ignored]);
+            co_return;
         }
 
         /**
@@ -1167,6 +1191,13 @@ namespace h2x {
         net::awaitable<void> handle_settings_frame(frame_codec& fc)
         {
             settings_frame sf(fc.data_, fc.size_);
+
+            // SETTINGS ACK 必须无 payload (RFC 9113 §6.5): 否则连接错误.
+            if (sf.ack_ && fc.payload_size() != 0) {
+                co_await send_goaway(0, http2_error_code::FRAME_SIZE_ERROR);
+                abort_ = true;
+                co_return;
+            }
 
             // 如果是 ACK，不需要处理.
             if (sf.ack_) {
