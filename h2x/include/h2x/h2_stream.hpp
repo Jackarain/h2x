@@ -1,4 +1,4 @@
-//
+﻿//
 // h2_stream.hpp
 // ~~~~~~~~~~~~~
 //
@@ -115,6 +115,14 @@ namespace h2x {
                 hf.end_stream_ = end_stream;
                 hf.end_headers_ = true;
 
+                // 对端修改过 SETTINGS_HEADER_TABLE_SIZE 时, 必须在头部块开头
+                // 发出动态表大小更新 (RFC 7541 §4.2/§6.3), 否则对端的解码
+                // 表与本端编码表会失步.
+                if (conn_->pending_enc_table_size_update_) {
+                    hf.set_dynamic_table_size_update(
+                        *conn_->pending_enc_table_size_update_);
+                }
+
                 for (auto& [name, value] : headers) {
                     hf.add_header(name, value,
                         &conn_->enc_dynamic_table_map_, &conn_->enc_dynamic_table_);
@@ -133,6 +141,8 @@ namespace h2x {
                                 conn_->peer_header_table_size_);
                         }
                     }
+                    // 大小更新已随本头部块发出, 清除待发送标记.
+                    conn_->pending_enc_table_size_update_.reset();
                     break;
                 }
 

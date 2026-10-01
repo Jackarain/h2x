@@ -591,7 +591,15 @@ namespace h2x {
             for (auto& e : entries) {
                 switch (static_cast<settings_id>(e.identifier_)) {
                 case settings_id::SETTINGS_HEADER_TABLE_SIZE:
-                    peer_header_table_size_ = e.value_;
+                    if (e.value_ != peer_header_table_size_) {
+                        peer_header_table_size_ = e.value_;
+                        // 立即按新上限驱逐编码方向动态表 (RFC 7541 §4.3),
+                        // 并记录需在下一个头部块开头发出的动态表大小更新.
+                        hpack_dynamic_table_shrink(enc_dynamic_table_,
+                            enc_dynamic_table_size_, e.value_,
+                            &enc_dynamic_table_map_);
+                        pending_enc_table_size_update_ = e.value_;
+                    }
                     break;
                 case settings_id::SETTINGS_ENABLE_PUSH:
                     // 取值只能是 0 或 1.
@@ -1657,6 +1665,10 @@ namespace h2x {
         std::vector<header_entry> enc_dynamic_table_;
         std::unordered_map<uint32_t, int> enc_dynamic_table_map_;
         size_t enc_dynamic_table_size_ = 0;
+
+        // 对端修改 SETTINGS_HEADER_TABLE_SIZE 后, 需在下一个头部块开头发出的
+        // 动态表大小更新 (RFC 7541 §4.2); 无待发送更新时为空.
+        std::optional<uint32_t> pending_enc_table_size_update_;
 
         // 用于标记是否需要中止连接.
         std::atomic_bool abort_{false};

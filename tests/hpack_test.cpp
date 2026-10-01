@@ -703,4 +703,87 @@ BOOST_AUTO_TEST_CASE(size_update_after_field_throws)
 
 BOOST_AUTO_TEST_SUITE_END()
 
+BOOST_AUTO_TEST_SUITE(hpack_dynamic_table_size_update_encode)
+
+static header_entry make_encode_entry(const std::string& name, const std::string& value)
+{
+    header_entry e{0, name, value, 0, &G_LITERAL_INCREMENTAL_INDEXING};
+    e.hash_ = frame_header_hash(e);
+    return e;
+}
+
+BOOST_AUTO_TEST_CASE(pack_headers_emits_size_update_first)
+{
+    uint8_t buf[256] = {0};
+
+    headers_frame hf(buf, sizeof(buf), false);
+    hf.end_headers_ = true;
+    hf.stream_id(1);
+    hf.set_dynamic_table_size_update(0);
+    hf.add_header(":method", "GET");
+
+    int total = hf.pack_headers();
+    BOOST_REQUIRE_GT(total, 9);
+    // 头部块首字节必须是动态表大小更新 (0x20), 值 0.
+    BOOST_CHECK_EQUAL(static_cast<int>(buf[9]), 0x20);
+
+    // 解码端应能解析: size update 到 0 后 :method=GET (静态索引 2 → 0x82).
+    std::vector<header_entry> table;
+    size_t table_size = 0;
+    size_t table_max = 4096;
+    headers_frame hf2(buf, sizeof(buf), false, &table);
+    hf2.set_decoder_table(&table, &table_size, &table_max, 4096);
+    hf2.unpack_headers();
+
+    BOOST_CHECK_EQUAL(table_max, 0u);
+    BOOST_REQUIRE_EQUAL(hf2.headers_.size(), 1u);
+    BOOST_CHECK_EQUAL(hf2.headers_[0].name_.value_or(""), ":method");
+    BOOST_CHECK_EQUAL(hf2.headers_[0].value_.value_or(""), "GET");
+}
+
+BOOST_AUTO_TEST_CASE(pack_headers_size_update_multibyte_value)
+{
+    uint8_t buf[256] = {0};
+
+    headers_frame hf(buf, sizeof(buf), false);
+    hf.end_headers_ = true;
+    hf.stream_id(1);
+    hf.set_dynamic_table_size_update(256);
+    hf.add_header(":method", "GET");
+
+    int total = hf.pack_headers();
+    BOOST_REQUIRE_GT(total, 9);
+
+    // 256 以 5 bit 前缀编码: 0x3F 0xE1 0x01 (RFC 7541 §5.1/§6.3).
+    BOOST_CHECK_EQUAL(static_cast<int>(buf[9]), 0x3F);
+    BOOST_CHECK_EQUAL(static_cast<int>(buf[10]), 0xE1);
+    BOOST_CHECK_EQUAL(static_cast<int>(buf[11]), 0x01);
+}
+
+BOOST_AUTO_TEST_CASE(shrink_updates_map_and_evicts_oldest)
+{
+    std::vector<header_entry> table;
+    std::unordered_map<uint32_t, int> map;
+    size_t table_size = 0;
+
+    auto a = make_encode_entry("x-a", "1");
+    auto b = make_encode_entry("x-b", "2");
+    hpack_dynamic_table_add(table, &map, table_size, a, 4096);
+    hpack_dynamic_table_add(table, &map, table_size, b, 4096);
+    BOOST_REQUIRE_EQUAL(table.size(), 2u);
+    BOOST_REQUIRE_EQUAL(table_size, 72u);
+    BOOST_CHECK_EQUAL(map[b.hash_], 0);
+
+    // 上限缩到 36: 驱逐最旧的 "x-a", map 中的旧哈希必须一并删除.
+    hpack_dynamic_table_shrink(table, table_size, 36, &map);
+
+    BOOST_CHECK_EQUAL(table.size(), 1u);
+    BOOST_CHECK_EQUAL(table_size, 36u);
+    BOOST_CHECK_EQUAL(table[0].name_.value_or(""), "x-b");
+    BOOST_CHECK_EQUAL(map.count(a.hash_), 0u);
+    BOOST_CHECK_EQUAL(map[b.hash_], 0);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
 } // namespace h2x

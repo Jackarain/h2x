@@ -468,8 +468,11 @@ namespace h2x {
     }
 
     // 缩小动态表上限时按需驱逐最旧条目 (RFC 7541 §4.3).
+    // 表尾是最旧条目, 驱逐不会改变剩余条目的索引, 但编码方向的 map 中
+    // 被驱逐哈希必须一并删除, 否则会命中越界索引 (传 nullptr 表示无 map).
     inline void hpack_dynamic_table_shrink(std::vector<header_entry>& table,
-                                           size_t& table_size, size_t max_size)
+                                           size_t& table_size, size_t max_size,
+                                           std::unordered_map<uint32_t, int>* map = nullptr)
     {
         while (table_size > max_size && !table.empty()) {
             auto& old = table.back();
@@ -477,8 +480,11 @@ namespace h2x {
             if (old.name_) old_size += old.name_->size();
             if (old.value_) old_size += old.value_->size();
             table_size -= old_size;
+            if (map) map->erase(old.hash_);
             table.pop_back();
         }
+        if (table.empty())
+            table_size = 0;
     }
 
     ////////////////////////////////////////////////////////////////////////////////
@@ -799,6 +805,12 @@ namespace h2x {
             dynamic_table_ = dt;
         }
 
+        // 编码方向: 在头部块开头写入动态表大小更新 (RFC 7541 §4.2/§6.3).
+        void set_dynamic_table_size_update(size_t size)
+        {
+            dynamic_table_size_update_.emplace(size);
+        }
+
         // 设置解码方向的动态表上下文; 设置后 unpack 过程中会就地维护表状态,
         // 使同一头部块内后续字段能引用到刚加入的表项 (RFC 7541 §6.2.1).
         // table_max 指向当前生效上限 (可被 size update 调整), limit 为本端
@@ -943,6 +955,20 @@ namespace h2x {
                 payload += 5;
                 size -= 5;
                 nbytes += 5;
+            }
+
+            // 动态表大小更新必须位于头部块的最开头 (RFC 7541 §4.2).
+            if (dynamic_table_size_update_) {
+                auto ret = hpack_pack_integer(*dynamic_table_size_update_,
+                    G_DYNAMIC_TABLE_SIZE_UPDATE.nbits_);
+                if (ret.empty() || size < ret.size()) {
+                    return -1;
+                }
+                ret[0] |= G_DYNAMIC_TABLE_SIZE_UPDATE.pattern_;
+                std::memcpy(payload, ret.data(), ret.size());
+                payload += ret.size();
+                size -= ret.size();
+                nbytes += static_cast<int>(ret.size());
             }
 
             // 填充 header block
