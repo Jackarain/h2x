@@ -2990,6 +2990,16 @@ BOOST_AUTO_TEST_CASE(headers_full_invalid_padding_returns_protocol_error)
         http2_error_code::PROTOCOL_ERROR);
 }
 
+// 回归: GOAWAY 的流标识符必须为 0 (RFC 9113 §6.8).
+BOOST_AUTO_TEST_CASE(goaway_nonzero_stream_id_rejected)
+{
+    uint8_t payload[8] = {0};
+    run_bad_frame_case(
+        build_raw_frame(1, static_cast<uint8_t>(frame_type::GOAWAY), 0,
+            payload, sizeof(payload)),
+        http2_error_code::PROTOCOL_ERROR);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace h2x

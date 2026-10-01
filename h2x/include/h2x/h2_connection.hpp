@@ -915,6 +915,14 @@ namespace h2x {
                     co_return;
                 }
                 break;
+            case frame_type::GOAWAY:
+                // GOAWAY 只作用于连接, 流标识符必须为 0 (RFC 9113 §6.8).
+                if (sid != 0) {
+                    co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                    abort_ = true;
+                    co_return;
+                }
+                break;
             case frame_type::PRIORITY:
             case frame_type::RST_STREAM:
                 // PRIORITY/RST_STREAM 必须关联到具体流.
