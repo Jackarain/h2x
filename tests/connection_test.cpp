@@ -1335,10 +1335,9 @@ BOOST_AUTO_TEST_CASE(large_headers_end_stream_over_continuation)
     BOOST_CHECK(st.clean_eof);
 }
 
-// 回归: 对端 SETTINGS_MAX_FRAME_SIZE 非法 (0) 时必须作为连接错误拒绝,
-// 且错误类型必须是 PROTOCOL_ERROR (RFC 9113 §6.5.2), 不能被接受
-// (否则后续发送会因 max_payload=0 空转).
-BOOST_AUTO_TEST_CASE(peer_settings_invalid_max_frame_size)
+// 运行一个"握手期非法 SETTINGS"场景: 服务端发送单项设置, 断言客户端
+// 以 PROTOCOL_ERROR 拒绝握手.
+static void run_settings_rejection_case(uint16_t id, uint32_t value)
 {
     net::io_context ioc(1);
     connection_test_state st;
@@ -1357,8 +1356,7 @@ BOOST_AUTO_TEST_CASE(peer_settings_invalid_max_frame_size)
         boost::system::error_code ec;
         auto sock = co_await acceptor.async_accept(net_awaitable[ec]);
         if (ec) { st.error = "accept: " + ec.message(); ioc.stop(); co_return; }
-        co_await run_bad_settings_server(std::move(sock),
-            static_cast<uint16_t>(settings_id::SETTINGS_MAX_FRAME_SIZE), 0);
+        co_await run_bad_settings_server(std::move(sock), id, value);
     }, net::detached);
 
     net::co_spawn(ioc, [&]() -> net::awaitable<void> {
@@ -1377,6 +1375,47 @@ BOOST_AUTO_TEST_CASE(peer_settings_invalid_max_frame_size)
     BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
     BOOST_CHECK_EQUAL(st.handshake_errc,
         make_error_code(errc::protocol_error).value());
+}
+
+// 回归: 对端 SETTINGS_MAX_FRAME_SIZE 非法 (0) 时必须作为连接错误拒绝,
+// 且错误类型必须是 PROTOCOL_ERROR (RFC 9113 §6.5.2), 不能被接受
+// (否则后续发送会因 max_payload=0 空转).
+BOOST_AUTO_TEST_CASE(peer_settings_invalid_max_frame_size)
+{
+    run_settings_rejection_case(
+        static_cast<uint16_t>(settings_id::SETTINGS_MAX_FRAME_SIZE), 0);
+}
+
+// 回归: 服务端不得把 SETTINGS_ENABLE_PUSH 显式设为 1, 客户端收到后必须
+// 作为连接错误 PROTOCOL_ERROR 处理 (RFC 9113 §6.5.2).
+BOOST_AUTO_TEST_CASE(server_enable_push_rejected)
+{
+    run_settings_rejection_case(
+        static_cast<uint16_t>(settings_id::SETTINGS_ENABLE_PUSH), 1);
+}
+
+// 回归: SETTINGS_ENABLE_PUSH 取值超出 0/1 属连接错误 PROTOCOL_ERROR
+// (RFC 9113 §6.5.2).
+BOOST_AUTO_TEST_CASE(enable_push_out_of_range_rejected)
+{
+    run_settings_rejection_case(
+        static_cast<uint16_t>(settings_id::SETTINGS_ENABLE_PUSH), 2);
+}
+
+// 回归: SETTINGS_ENABLE_CONNECT_PROTOCOL 取值必须是 0 或 1
+// (RFC 8441 §3), 其它取值属连接错误 PROTOCOL_ERROR.
+BOOST_AUTO_TEST_CASE(enable_connect_protocol_out_of_range_rejected)
+{
+    run_settings_rejection_case(
+        static_cast<uint16_t>(settings_id::SETTINGS_ENABLE_CONNECT_PROTOCOL), 2);
+}
+
+// 回归: SETTINGS_NO_RFC7540_PRIORITIES 取值必须是 0 或 1
+// (RFC 9218 §2.1), 其它取值属连接错误 PROTOCOL_ERROR.
+BOOST_AUTO_TEST_CASE(no_rfc7540_priorities_out_of_range_rejected)
+{
+    run_settings_rejection_case(
+        static_cast<uint16_t>(settings_id::SETTINGS_NO_RFC7540_PRIORITIES), 2);
 }
 
 // 回归: 同一头部块内先用增量索引加入表项, 再引用该表项 (索引 62),

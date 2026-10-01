@@ -605,6 +605,10 @@ namespace h2x {
                     // 取值只能是 0 或 1.
                     if (e.value_ > 1)
                         return http2_error_code::PROTOCOL_ERROR;
+                    // 服务端不得显式把该值设为 1, 客户端收到即为连接错误
+                    // (RFC 9113 §6.5.2).
+                    if (role_ == role::client && e.value_ != 0)
+                        return http2_error_code::PROTOCOL_ERROR;
                     break;
                 case settings_id::SETTINGS_MAX_CONCURRENT_STREAMS:
                     peer_max_concurrent_streams_ = e.value_;
@@ -635,6 +639,16 @@ namespace h2x {
                     if (e.value_ < 16384 || e.value_ > 0xFFFFFF)
                         return http2_error_code::PROTOCOL_ERROR;
                     peer_max_frame_size_ = e.value_;
+                    break;
+                case settings_id::SETTINGS_ENABLE_CONNECT_PROTOCOL:
+                    // 取值必须是 0 或 1 (RFC 8441 §3).
+                    if (e.value_ > 1)
+                        return http2_error_code::PROTOCOL_ERROR;
+                    break;
+                case settings_id::SETTINGS_NO_RFC7540_PRIORITIES:
+                    // 取值必须是 0 或 1 (RFC 9218 §2.1).
+                    if (e.value_ > 1)
+                        return http2_error_code::PROTOCOL_ERROR;
                     break;
                 default:
                     break;
