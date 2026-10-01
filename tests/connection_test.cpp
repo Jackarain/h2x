@@ -2697,6 +2697,124 @@ BOOST_AUTO_TEST_CASE(push_promise_on_stream_zero_rejected)
         http2_error_code::PROTOCOL_ERROR);
 }
 
+// 服务端: 响应头带 END_STREAM 关闭远端方向后, 再发一个 HEADERS (非法).
+static net::awaitable<void> run_headers_after_end_stream_server(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    std::vector<uint8_t> preface(24);
+    co_await net::async_read(sock, net::buffer(preface), net_awaitable[ec]);
+    if (ec) { st.error = "server: read preface: " + ec.message(); co_return; }
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no settings"; co_return; }
+    auto sf = build_settings_frame(false);
+    co_await net::async_write(sock, net::buffer(sf), net_awaitable[ec]);
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no settings ack"; co_return; }
+    auto sa = build_settings_frame(true);
+    co_await net::async_write(sock, net::buffer(sa), net_awaitable[ec]);
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no request"; co_return; }
+
+    // 响应头带 END_STREAM: 远端方向关闭, 流进入 half-closed(remote).
+    auto hf = build_headers_frame(1, {{":status", "200"}}, true);
+    co_await net::async_write(sock, net::buffer(hf), net_awaitable[ec]);
+
+    net::steady_timer timer(co_await net::this_coro::executor);
+    timer.expires_after(50ms);
+    co_await timer.async_wait(net_awaitable[ec]);
+
+    // 之后再发 HEADERS 属流错误 STREAM_CLOSED (RFC 9113 §5.1).
+    auto hf2 = build_headers_frame(1, {{"x-trailer", "1"}}, true);
+    co_await net::async_write(sock, net::buffer(hf2), net_awaitable[ec]);
+
+    auto f = co_await read_frame(sock);
+    if (f.size() >= 13) {
+        st.observed_frame_type = f[3];
+        st.observed_error_code = (uint32_t(f[9]) << 24) | (uint32_t(f[10]) << 16)
+            | (uint32_t(f[11]) << 8) | f[12];
+    }
+    sock.close();
+}
+
+static net::awaitable<void> run_headers_after_end_stream_client(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    using conn_type = connection<net::ip::tcp::socket>;
+    auto conn = std::make_shared<conn_type>(std::move(sock));
+
+    settings s;
+    co_await conn->async_handshake(role::client, s, ec);
+    if (ec) { st.error = "client: handshake: " + ec.message(); co_return; }
+
+    auto req = co_await conn->async_request();
+    if (!req.has_value()) { st.error = "client: async_request failed"; co_return; }
+    auto stream = std::move(req.value());
+
+    // 不带 END_STREAM: 本端方向保持打开, 响应 END_STREAM 后流停留在
+    // half-closed(remote), 不会被回收.
+    ec = co_await stream.async_write_headers({
+        {":method", "GET"}, {":path", "/"}, {":scheme", "https"},
+        {":authority", "test.local"},
+    }, false);
+    if (ec) { st.error = "client: write headers: " + ec.message(); co_return; }
+
+    auto hdr = co_await stream.async_read_headers();
+    if (!hdr.has_value()) { st.error = "client: read headers failed"; co_return; }
+
+    net::steady_timer timer(co_await net::this_coro::executor);
+    timer.expires_after(150ms);
+    co_await timer.async_wait(net_awaitable[ec]);
+
+    conn->close();
+    co_await conn->async_wait_pump(3s);
+}
+
+// 回归: 远端已发送 END_STREAM 后再收到 HEADERS 必须回 RST_STREAM
+// (STREAM_CLOSED) 且不得交付字段 (RFC 9113 §5.1).
+BOOST_AUTO_TEST_CASE(headers_after_remote_end_stream_rejected)
+{
+    net::io_context ioc(1);
+    connection_test_state st;
+
+    net::ip::tcp::acceptor acceptor(
+        ioc, net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    auto port = acceptor.local_endpoint().port();
+
+    net::steady_timer watchdog(ioc);
+    watchdog.expires_after(10s);
+    watchdog.async_wait([&](boost::system::error_code ec) {
+        if (!ec) { st.error = "test timeout"; ioc.stop(); }
+    });
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        auto sock = co_await acceptor.async_accept(net_awaitable[ec]);
+        if (ec) { st.error = "accept: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_headers_after_end_stream_server(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        net::ip::tcp::socket sock(ioc);
+        std::vector<net::ip::tcp::endpoint> endpoints{
+            net::ip::tcp::endpoint(net::ip::make_address("127.0.0.1"), port)};
+        co_await net::async_connect(sock, endpoints, net_awaitable[ec]);
+        if (ec) { st.error = "connect: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_headers_after_end_stream_client(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    ioc.run();
+
+    BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
+    BOOST_CHECK_EQUAL(static_cast<int>(st.observed_frame_type),
+        static_cast<int>(frame_type::RST_STREAM));
+    BOOST_CHECK_EQUAL(st.observed_error_code,
+        static_cast<uint32_t>(http2_error_code::STREAM_CLOSED));
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace h2x

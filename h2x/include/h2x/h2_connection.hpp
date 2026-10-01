@@ -724,6 +724,7 @@ namespace h2x {
             bool reset_received = false;
             bool pending_end_stream = false;  // 暂存分片 HEADERS 的 END_STREAM 标志.
             bool headers_in_progress = false; // 分片 HEADERS (END_HEADERS 未置位) 是否在途.
+            bool discard_headers = false;     // 已关闭流上的头部块: 解码后丢弃.
             bool refused = false;             // 超过并发上限; 仅用于解码 HPACK 后拒绝.
 
             // 流控窗口.
@@ -1095,6 +1096,13 @@ namespace h2x {
 
             auto& sd = it->second;
 
+            // 远端已发送 END_STREAM (half-closed(remote)), 或流已关闭/被重置时,
+            // 再收到 HEADERS 属流错误 STREAM_CLOSED (RFC 9113 §5.1).
+            // 头部块仍须解码以维持 HPACK 动态表同步, 但字段不得交付应用.
+            const bool headers_after_remote_end =
+                (sd.state == stream_state::half_closed_remote) ||
+                (sd.state == stream_state::closed) || sd.reset_received;
+
             // 只解析 flags，不解码 HPACK（避免在 end_headers_=false 时解析截断数据导致异常）.
             headers_frame hf(fc.data_, fc.size_, false, &dec_dynamic_table_);
             hf.parse_flags();
@@ -1117,17 +1125,26 @@ namespace h2x {
                     co_return;
                 }
 
-                // 复制解码结果 (动态表已在解析过程中就地更新).
-                for (auto& h : hf.headers_) {
-                    sd.headers.emplace_back(h);
-                }
-
                 // 头部块已解码 (动态表已同步), 此时再拒绝超限的新流.
                 if (sd.refused) {
                     sd.headers.clear();
                     co_await send_rst_stream(sid, http2_error_code::REFUSED_STREAM);
                     streams_.erase(sid);
                     co_return;
+                }
+
+                // 远端方向已结束的流上收到的 HEADERS 仅用于同步 HPACK,
+                // 字段必须丢弃, 并按流错误回 STREAM_CLOSED (RFC 9113 §5.1).
+                if (headers_after_remote_end) {
+                    if (sd.state == stream_state::half_closed_remote) {
+                        co_await send_rst_stream(sid, http2_error_code::STREAM_CLOSED);
+                    }
+                    co_return;
+                }
+
+                // 复制解码结果 (动态表已在解析过程中就地更新).
+                for (auto& h : hf.headers_) {
+                    sd.headers.emplace_back(h);
                 }
 
                 if (hf.end_stream_) {
@@ -1153,6 +1170,8 @@ namespace h2x {
                 sd.headers_in_progress = true;
                 header_block_sid_ = sid;
                 sd.pending_end_stream = hf.end_stream_;
+                if (headers_after_remote_end)
+                    sd.discard_headers = true;
                 auto payload = fc.payload();
                 auto plen = fc.payload_size();
                 // 跳过 padding / priority 前缀 (与 unpack_headers 逻辑保持一致).
@@ -1492,6 +1511,18 @@ namespace h2x {
                     header_block_sid_ = 0;
                     co_await send_rst_stream(sid, http2_error_code::REFUSED_STREAM);
                     streams_.erase(sid);
+                    co_return;
+                }
+
+                // 远端方向已结束的流: 头部块仅用于同步 HPACK, 字段丢弃.
+                if (sd.discard_headers) {
+                    sd.discard_headers = false;
+                    sd.pending_header_block.clear();
+                    sd.headers_in_progress = false;
+                    header_block_sid_ = 0;
+                    if (sd.state == stream_state::half_closed_remote) {
+                        co_await send_rst_stream(sid, http2_error_code::STREAM_CLOSED);
+                    }
                     co_return;
                 }
 
