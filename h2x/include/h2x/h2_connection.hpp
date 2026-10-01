@@ -537,7 +537,7 @@ namespace h2x {
          * 模板参数 Frame 为帧类型，setup 回调用于设置帧特有字段。
          */
         template <class Frame, class Setup>
-        net::awaitable<void> send_control_frame(uint32_t sid, frame_type ft, Setup&& setup)
+        void enqueue_control_frame(uint32_t sid, frame_type ft, Setup&& setup)
         {
             auto buf = std::vector<uint8_t>(64, 0);
             Frame f(buf.data(), buf.size(), false);
@@ -547,6 +547,12 @@ namespace h2x {
             f.pack_payload();
             buf.resize(f.frame_size());
             write_frame_data(std::move(buf));
+        }
+
+        template <class Frame, class Setup>
+        net::awaitable<void> send_control_frame(uint32_t sid, frame_type ft, Setup&& setup)
+        {
+            enqueue_control_frame<Frame>(sid, ft, std::forward<Setup>(setup));
             co_return;
         }
 
@@ -750,6 +756,36 @@ namespace h2x {
         }
 
         // 处理接收到的各个类型帧.
+        // 按帧类型校验 payload 长度 (RFC 9113 §4.2 / §6).
+        // 返回 std::nullopt 表示合法; 否则返回应上报的连接错误码.
+        static std::optional<http2_error_code> frame_length_error(
+            frame_type type, uint32_t plen)
+        {
+            switch (type) {
+            case frame_type::PING:
+                if (plen != 8) return http2_error_code::FRAME_SIZE_ERROR;
+                break;
+            case frame_type::RST_STREAM:
+                if (plen != 4) return http2_error_code::FRAME_SIZE_ERROR;
+                break;
+            case frame_type::PRIORITY:
+                if (plen != 5) return http2_error_code::FRAME_SIZE_ERROR;
+                break;
+            case frame_type::SETTINGS:
+                if (plen % 6 != 0) return http2_error_code::FRAME_SIZE_ERROR;
+                break;
+            case frame_type::GOAWAY:
+                if (plen < 8) return http2_error_code::FRAME_SIZE_ERROR;
+                break;
+            case frame_type::PUSH_PROMISE:
+                if (plen < 4) return http2_error_code::FRAME_SIZE_ERROR;
+                break;
+            default:
+                break;
+            }
+            return std::nullopt;
+        }
+
         net::awaitable<void> handle_frame(frame_codec& fc)
         {
             auto type = fc.type();
@@ -761,6 +797,13 @@ namespace h2x {
             if (header_block_sid_ != 0
                 && !(type == frame_type::CONTINUATION && sid == header_block_sid_)) {
                 co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                abort_ = true;
+                co_return;
+            }
+
+            // 帧长度不合法属连接错误: 回对应错误帧而不是静默断连.
+            if (auto err = frame_length_error(type, fc.payload_size())) {
+                co_await send_goaway(0, *err);
                 abort_ = true;
                 co_return;
             }
@@ -1378,6 +1421,17 @@ namespace h2x {
                 [increment](auto& f) { f.set_window_increment(increment); });
         }
 
+        // 非协程版本, 供 catch 处理器 (不允许 co_await) 回错误帧使用.
+        void enqueue_goaway(uint32_t last_sid, http2_error_code code)
+        {
+            enqueue_control_frame<goaway_frame>(
+                0, frame_type::GOAWAY,
+                [last_sid, code](auto& f) {
+                    f.set_last_stream_id(last_sid);
+                    f.set_error_code(code);
+                });
+        }
+
         net::awaitable<void> send_goaway(uint32_t last_sid, http2_error_code code)
         {
             co_return co_await send_control_frame<goaway_frame>(
@@ -1462,6 +1516,11 @@ namespace h2x {
                     co_await async_read_frame(fc, ec);
                     if (ec) {
                         if (!abort_) {
+                            // 帧超过本端 SETTINGS_MAX_FRAME_SIZE 等长度问题
+                            // 属于连接错误, 回 GOAWAY 而不是静默关闭连接.
+                            if (ec == make_error_code(errc::frame_size_error)) {
+                                co_await send_goaway(0, http2_error_code::FRAME_SIZE_ERROR);
+                            }
                             abort_ = true;
                         }
                         break;
@@ -1475,7 +1534,11 @@ namespace h2x {
                     // 下方的清理逻辑, 导致 pump_out 永久阻塞在
                     // out_notifier_.async_wait() 上, 进而使
                     // (pump_in() && pump_out()) 永不完成 → 死锁.
+                    // payload 解析失败 (如 padding 非法) 属连接错误, 回
+                    // GOAWAY(PROTOCOL_ERROR) 而不是静默断开; catch 处理器
+                    // 内不允许 co_await, 故用非协程入队.
                     if (!abort_) {
+                        enqueue_goaway(0, http2_error_code::PROTOCOL_ERROR);
                         abort_ = true;
                     }
                     break;

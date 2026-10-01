@@ -2113,6 +2113,134 @@ BOOST_AUTO_TEST_CASE(rst_stream_on_idle_peer_stream_rejected)
     run_idle_rst_case(2);
 }
 
+// 服务端: 握手后发送一个畸形帧, 观察客户端是否回错误帧而非静默断连.
+static net::awaitable<void> run_bad_frame_server(
+    net::ip::tcp::socket sock, connection_test_state& st,
+    std::vector<uint8_t> bad_frame)
+{
+    boost::system::error_code ec;
+
+    std::vector<uint8_t> preface(24);
+    co_await net::async_read(sock, net::buffer(preface), net_awaitable[ec]);
+    if (ec) { st.error = "server: read preface: " + ec.message(); co_return; }
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no settings"; co_return; }
+    auto sf = build_settings_frame(false);
+    co_await net::async_write(sock, net::buffer(sf), net_awaitable[ec]);
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no settings ack"; co_return; }
+    auto sa = build_settings_frame(true);
+    co_await net::async_write(sock, net::buffer(sa), net_awaitable[ec]);
+
+    co_await net::async_write(sock, net::buffer(bad_frame), net_awaitable[ec]);
+
+    // 客户端可能先发出请求 HEADERS, 因此持续读取直到看到 GOAWAY.
+    for (int i = 0; i < 6; ++i) {
+        auto f = co_await read_frame(sock);
+        if (f.size() < 9) break;
+        if (f[3] == static_cast<uint8_t>(frame_type::GOAWAY) && f.size() >= 17) {
+            st.observed_frame_type = f[3];
+            st.observed_error_code = (static_cast<uint32_t>(f[13]) << 24)
+                | (static_cast<uint32_t>(f[14]) << 16)
+                | (static_cast<uint32_t>(f[15]) << 8)
+                | static_cast<uint32_t>(f[16]);
+            break;
+        }
+    }
+    sock.close();
+}
+
+static net::awaitable<void> run_bad_frame_client(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    using conn_type = connection<net::ip::tcp::socket>;
+    auto conn = std::make_shared<conn_type>(std::move(sock));
+
+    settings s;
+    co_await conn->async_handshake(role::client, s, ec);
+    if (ec) { st.error = "client: handshake: " + ec.message(); co_return; }
+
+    auto req = co_await conn->async_request();
+    if (!req.has_value()) { st.error = "client: async_request failed"; co_return; }
+    auto stream = std::move(req.value());
+    ec = co_await stream.async_write_headers({
+        {":method", "GET"}, {":path", "/"}, {":scheme", "https"},
+        {":authority", "test.local"},
+    }, true);
+    if (ec) { st.error = "client: write headers: " + ec.message(); co_return; }
+
+    net::steady_timer timer(co_await net::this_coro::executor);
+    timer.expires_after(300ms);
+    co_await timer.async_wait(net_awaitable[ec]);
+
+    conn->close();
+    co_await conn->async_wait_pump(3s);
+}
+
+// 运行一个"畸形帧"场景, 断言客户端回 GOAWAY 且错误码为 expected.
+static void run_bad_frame_case(
+    std::vector<uint8_t> bad_frame, http2_error_code expected)
+{
+    net::io_context ioc(1);
+    connection_test_state st;
+
+    net::ip::tcp::acceptor acceptor(
+        ioc, net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    auto port = acceptor.local_endpoint().port();
+
+    net::steady_timer watchdog(ioc);
+    watchdog.expires_after(10s);
+    watchdog.async_wait([&](boost::system::error_code ec) {
+        if (!ec) { st.error = "test timeout"; ioc.stop(); }
+    });
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        auto sock = co_await acceptor.async_accept(net_awaitable[ec]);
+        if (ec) { st.error = "accept: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_bad_frame_server(std::move(sock), st, std::move(bad_frame));
+        ioc.stop();
+    }, net::detached);
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        net::ip::tcp::socket sock(ioc);
+        std::vector<net::ip::tcp::endpoint> endpoints{
+            net::ip::tcp::endpoint(net::ip::make_address("127.0.0.1"), port)};
+        co_await net::async_connect(sock, endpoints, net_awaitable[ec]);
+        if (ec) { st.error = "connect: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_bad_frame_client(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    ioc.run();
+
+    BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
+    BOOST_CHECK_EQUAL(static_cast<int>(st.observed_frame_type),
+        static_cast<int>(frame_type::GOAWAY));
+    BOOST_CHECK_EQUAL(st.observed_error_code, static_cast<uint32_t>(expected));
+}
+
+// 回归: 长度非法的帧必须回错误帧而非静默断连 (RFC 9113 §4.2/§6.5).
+BOOST_AUTO_TEST_CASE(malformed_ping_length_returns_frame_size_error)
+{
+    uint8_t p4[4] = {1, 2, 3, 4};
+    run_bad_frame_case(
+        build_raw_frame(0, static_cast<uint8_t>(frame_type::PING), 0, p4, sizeof(p4)),
+        http2_error_code::FRAME_SIZE_ERROR);
+}
+
+// 回归: DATA 的 padding 非法属连接错误, 必须回 GOAWAY(PROTOCOL_ERROR)
+// (RFC 9113 §6.1).
+BOOST_AUTO_TEST_CASE(malformed_data_padding_returns_protocol_error)
+{
+    uint8_t pad[1] = {5};  // pad length 5 >= payload size 1
+    run_bad_frame_case(
+        build_raw_frame(1, static_cast<uint8_t>(frame_type::DATA),
+            static_cast<uint8_t>(frame_flag::PADDED), pad, sizeof(pad)),
+        http2_error_code::PROTOCOL_ERROR);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace h2x
