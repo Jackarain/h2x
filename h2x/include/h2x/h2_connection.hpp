@@ -756,6 +756,15 @@ namespace h2x {
             auto sid = fc.stream_id();
             auto flags = fc.flags();
 
+            // 头部块在途期间 (HEADERS 未置 END_HEADERS), 只允许同一流上的
+            // CONTINUATION 帧, 其它任何帧都是连接错误 (RFC 9113 §6.2/§6.10).
+            if (header_block_sid_ != 0
+                && !(type == frame_type::CONTINUATION && sid == header_block_sid_)) {
+                co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                abort_ = true;
+                co_return;
+            }
+
             // 部分帧类型对 stream id 有强约束 (RFC 7540 §6): 违反即连接错误.
             switch (type) {
             case frame_type::SETTINGS:
@@ -1021,6 +1030,7 @@ namespace h2x {
                     co_return;
                 }
                 sd.headers_in_progress = true;
+                header_block_sid_ = sid;
                 sd.pending_end_stream = hf.end_stream_;
                 auto payload = fc.payload();
                 auto plen = fc.payload_size();
@@ -1307,6 +1317,7 @@ namespace h2x {
                     sd.headers.clear();
                     sd.pending_header_block.clear();
                     sd.headers_in_progress = false;
+                    header_block_sid_ = 0;
                     co_await send_rst_stream(sid, http2_error_code::REFUSED_STREAM);
                     streams_.erase(sid);
                     co_return;
@@ -1323,6 +1334,7 @@ namespace h2x {
 
                 sd.pending_header_block.clear();
                 sd.headers_in_progress = false;
+                header_block_sid_ = 0;
 
                 // 尝试释放已终止且数据已消费完的流.
                 maybe_release_stream(sid);
@@ -1514,6 +1526,10 @@ namespace h2x {
 
         // 最后一个流 ID（GOAWAY 用）.
         uint32_t last_stream_id_ = 0;
+
+        // 正在接收的头部块所属流 ID (0 表示当前无在途头部块).
+        // HEADERS 未置 END_HEADERS 后, 只允许同流的 CONTINUATION 帧.
+        uint32_t header_block_sid_ = 0;
 
         // 解码方向动态表 (对端编码器写入), 上限为本端 SETTINGS_HEADER_TABLE_SIZE.
         std::vector<header_entry> dec_dynamic_table_;

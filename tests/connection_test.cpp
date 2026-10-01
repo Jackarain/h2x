@@ -1876,6 +1876,122 @@ BOOST_AUTO_TEST_CASE(data_after_remote_end_stream_rejected)
     BOOST_CHECK_EQUAL(st.body_bytes, 0u);
 }
 
+// 服务端: 发送未置 END_HEADERS 的 HEADERS 后插入 PING, 观察客户端回帧.
+static net::awaitable<void> run_interleaved_frame_server(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    std::vector<uint8_t> preface(24);
+    co_await net::async_read(sock, net::buffer(preface), net_awaitable[ec]);
+    if (ec) { st.error = "server: read preface: " + ec.message(); co_return; }
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no settings"; co_return; }
+    auto sf = build_settings_frame(false);
+    co_await net::async_write(sock, net::buffer(sf), net_awaitable[ec]);
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no settings ack"; co_return; }
+    auto sa = build_settings_frame(true);
+    co_await net::async_write(sock, net::buffer(sa), net_awaitable[ec]);
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no request"; co_return; }
+
+    // 响应头未置 END_HEADERS, 头部块在途期间插入一个合法 PING 帧.
+    auto hf = build_headers_frame(1, {{":status", "200"}}, false);
+    hf[4] = static_cast<uint8_t>(hf[4]
+        & ~static_cast<uint8_t>(frame_flag::END_HEADERS));
+    co_await net::async_write(sock, net::buffer(hf), net_awaitable[ec]);
+
+    uint8_t ping_payload[8] = {0, 0, 0, 0, 0, 0, 0, 1};
+    auto ping = build_raw_frame(0, static_cast<uint8_t>(frame_type::PING),
+        0, ping_payload, sizeof(ping_payload));
+    co_await net::async_write(sock, net::buffer(ping), net_awaitable[ec]);
+
+    auto f = co_await read_frame(sock);
+    if (f.size() >= 9) {
+        st.observed_frame_type = f[3];
+        if (f.size() >= 17) {
+            st.observed_error_code = (static_cast<uint32_t>(f[13]) << 24)
+                | (static_cast<uint32_t>(f[14]) << 16)
+                | (static_cast<uint32_t>(f[15]) << 8)
+                | static_cast<uint32_t>(f[16]);
+        }
+    }
+    sock.close();
+}
+
+static net::awaitable<void> run_interleaved_frame_client(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    using conn_type = connection<net::ip::tcp::socket>;
+    auto conn = std::make_shared<conn_type>(std::move(sock));
+
+    settings s;
+    co_await conn->async_handshake(role::client, s, ec);
+    if (ec) { st.error = "client: handshake: " + ec.message(); co_return; }
+
+    auto req = co_await conn->async_request();
+    if (!req.has_value()) { st.error = "client: async_request failed"; co_return; }
+    auto stream = std::move(req.value());
+
+    ec = co_await stream.async_write_headers({
+        {":method", "GET"}, {":path", "/"}, {":scheme", "https"},
+        {":authority", "test.local"},
+    }, true);
+    if (ec) { st.error = "client: write headers: " + ec.message(); co_return; }
+
+    net::steady_timer timer(co_await net::this_coro::executor);
+    timer.expires_after(300ms);
+    co_await timer.async_wait(net_awaitable[ec]);
+
+    conn->close();
+    co_await conn->async_wait_pump(3s);
+}
+
+// 回归: 头部块 (未置 END_HEADERS) 在途期间出现非 CONTINUATION 帧属于连接错误,
+// 必须回 GOAWAY(PROTOCOL_ERROR) (RFC 9113 §6.10).
+BOOST_AUTO_TEST_CASE(interleaved_frame_during_header_block_rejected)
+{
+    net::io_context ioc(1);
+    connection_test_state st;
+
+    net::ip::tcp::acceptor acceptor(
+        ioc, net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    auto port = acceptor.local_endpoint().port();
+
+    net::steady_timer watchdog(ioc);
+    watchdog.expires_after(10s);
+    watchdog.async_wait([&](boost::system::error_code ec) {
+        if (!ec) { st.error = "test timeout"; ioc.stop(); }
+    });
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        auto sock = co_await acceptor.async_accept(net_awaitable[ec]);
+        if (ec) { st.error = "accept: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_interleaved_frame_server(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        net::ip::tcp::socket sock(ioc);
+        std::vector<net::ip::tcp::endpoint> endpoints{
+            net::ip::tcp::endpoint(net::ip::make_address("127.0.0.1"), port)};
+        co_await net::async_connect(sock, endpoints, net_awaitable[ec]);
+        if (ec) { st.error = "connect: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_interleaved_frame_client(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    ioc.run();
+
+    BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
+    BOOST_CHECK_EQUAL(static_cast<int>(st.observed_frame_type),
+        static_cast<int>(frame_type::GOAWAY));
+    BOOST_CHECK_EQUAL(st.observed_error_code,
+        static_cast<uint32_t>(http2_error_code::PROTOCOL_ERROR));
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace h2x
