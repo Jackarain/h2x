@@ -867,6 +867,13 @@ namespace h2x {
                 co_return;
             }
 
+            // DATA 只允许出现在 open / half-closed(local) 状态 (RFC 9113 §6.1);
+            // half-closed(remote) 表示对端已发送 END_STREAM, 之后不应再有 DATA.
+            if (sd.state == stream_state::half_closed_remote) {
+                co_await send_rst_stream(sid, http2_error_code::STREAM_CLOSED);
+                co_return;
+            }
+
             // 流级窗口.
             if (data_len > sd.local_window) {
                 co_await send_rst_stream(sid, http2_error_code::FLOW_CONTROL_ERROR);
