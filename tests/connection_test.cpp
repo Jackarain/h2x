@@ -3377,6 +3377,32 @@ BOOST_AUTO_TEST_CASE(connection_error_wakes_pending_reader)
         static_cast<int>(frame_type::GOAWAY));
 }
 
+
+// 回归: 保留流 (reserved) 上收到 DATA 属连接错误 PROTOCOL_ERROR
+// (RFC 9113 §5.1).
+BOOST_AUTO_TEST_CASE(data_on_reserved_stream_rejected)
+{
+    uint8_t block[1] = {0x82};
+    uint8_t d[1] = {'x'};
+    run_push_reject_case(
+        {build_push_promise_frame(1, 2, block, sizeof(block)),
+         build_raw_frame(2, static_cast<uint8_t>(frame_type::DATA), 0, d, sizeof(d))},
+        http2_error_code::PROTOCOL_ERROR);
+}
+
+// 回归: 保留流 (reserved) 上收到 WINDOW_UPDATE 属连接错误 PROTOCOL_ERROR
+// (RFC 9113 §5.1).
+BOOST_AUTO_TEST_CASE(window_update_on_reserved_stream_rejected)
+{
+    uint8_t block[1] = {0x82};
+    uint8_t inc[4] = {0, 0, 0, 1};
+    run_push_reject_case(
+        {build_push_promise_frame(1, 2, block, sizeof(block)),
+         build_raw_frame(2, static_cast<uint8_t>(frame_type::WINDOW_UPDATE), 0,
+             inc, sizeof(inc))},
+        http2_error_code::PROTOCOL_ERROR);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace h2x

@@ -1024,6 +1024,15 @@ namespace h2x {
 
             auto& sd = it->second;
 
+            // 保留流 (reserved) 上不允许 DATA: 连接错误 PROTOCOL_ERROR
+            // (RFC 9113 §5.1).
+            if (sd.state == stream_state::reserved_remote ||
+                sd.state == stream_state::reserved_local) {
+                co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                abort_ = true;
+                co_return;
+            }
+
             // 如果流已关闭或收到重置，忽略 DATA 帧 (连接级窗口已入账).
             if (sd.state == stream_state::closed || sd.reset_received) {
                 co_return;
@@ -1461,6 +1470,19 @@ namespace h2x {
                 co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
                 abort_ = true;
                 co_return;
+            }
+
+            // 保留流 (reserved) 上不允许 WINDOW_UPDATE: 连接错误 PROTOCOL_ERROR
+            // (RFC 9113 §5.1); 该检查先于增量校验, 与 nghttp2 顺序一致.
+            if (sid != 0) {
+                auto rit = streams_.find(sid);
+                if (rit != streams_.end() &&
+                    (rit->second.state == stream_state::reserved_remote ||
+                     rit->second.state == stream_state::reserved_local)) {
+                    co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                    abort_ = true;
+                    co_return;
+                }
             }
 
             window_update_frame wuf(fc.data_, fc.size_);
