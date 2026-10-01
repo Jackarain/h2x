@@ -2697,6 +2697,7 @@ BOOST_AUTO_TEST_CASE(push_promise_on_stream_zero_rejected)
         http2_error_code::PROTOCOL_ERROR);
 }
 
+
 // 服务端: 响应头带 END_STREAM 关闭远端方向后, 再发一个 HEADERS (非法).
 static net::awaitable<void> run_headers_after_end_stream_server(
     net::ip::tcp::socket sock, connection_test_state& st)
@@ -2813,6 +2814,180 @@ BOOST_AUTO_TEST_CASE(headers_after_remote_end_stream_rejected)
         static_cast<int>(frame_type::RST_STREAM));
     BOOST_CHECK_EQUAL(st.observed_error_code,
         static_cast<uint32_t>(http2_error_code::STREAM_CLOSED));
+}
+
+
+// ── HEADERS 前缀 / GOAWAY 流标识符校验 (RFC 9113 §4.2, §6.2, §6.8) ──
+
+// 服务端: 握手并在收到客户端请求后, 发送一个畸形响应 HEADERS.
+static net::awaitable<void> run_malformed_response_server(
+    net::ip::tcp::socket sock, connection_test_state& st,
+    std::vector<uint8_t> frame)
+{
+    boost::system::error_code ec;
+
+    std::vector<uint8_t> preface(24);
+    co_await net::async_read(sock, net::buffer(preface), net_awaitable[ec]);
+    if (ec) { st.error = "server: read preface: " + ec.message(); co_return; }
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no settings"; co_return; }
+    auto sf = build_settings_frame(false);
+    co_await net::async_write(sock, net::buffer(sf), net_awaitable[ec]);
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no settings ack"; co_return; }
+    auto sa = build_settings_frame(true);
+    co_await net::async_write(sock, net::buffer(sa), net_awaitable[ec]);
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no request"; co_return; }
+
+    co_await net::async_write(sock, net::buffer(frame), net_awaitable[ec]);
+
+    for (int i = 0; i < 6; ++i) {
+        auto f = co_await read_frame(sock);
+        if (f.size() < 9) break;
+        if (f[3] == static_cast<uint8_t>(frame_type::GOAWAY) && f.size() >= 17) {
+            st.observed_frame_type = f[3];
+            st.observed_error_code = (static_cast<uint32_t>(f[13]) << 24)
+                | (static_cast<uint32_t>(f[14]) << 16)
+                | (static_cast<uint32_t>(f[15]) << 8)
+                | static_cast<uint32_t>(f[16]);
+            break;
+        }
+    }
+    sock.close();
+}
+
+static net::awaitable<void> run_malformed_response_client(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    using conn_type = connection<net::ip::tcp::socket>;
+    auto conn = std::make_shared<conn_type>(std::move(sock));
+
+    co_await conn->async_handshake(role::client, settings{}, ec);
+    if (ec) { st.error = "client: handshake: " + ec.message(); co_return; }
+
+    auto req = co_await conn->async_request();
+    if (!req.has_value()) { st.error = "client: async_request failed"; co_return; }
+    auto stream = std::move(req.value());
+    ec = co_await stream.async_write_headers({
+        {":method", "GET"}, {":path", "/"}, {":scheme", "https"},
+        {":authority", "test.local"},
+    }, false);
+    if (ec) { st.error = "client: write headers: " + ec.message(); co_return; }
+
+    net::steady_timer timer(co_await net::this_coro::executor);
+    timer.expires_after(200ms);
+    co_await timer.async_wait(net_awaitable[ec]);
+
+    conn->close();
+    co_await conn->async_wait_pump(3s);
+}
+
+static void run_malformed_response_case(
+    std::vector<uint8_t> frame, http2_error_code expected)
+{
+    net::io_context ioc(1);
+    connection_test_state st;
+
+    net::ip::tcp::acceptor acceptor(
+        ioc, net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    auto port = acceptor.local_endpoint().port();
+
+    net::steady_timer watchdog(ioc);
+    watchdog.expires_after(10s);
+    watchdog.async_wait([&](boost::system::error_code ec) {
+        if (!ec) { st.error = "test timeout"; ioc.stop(); }
+    });
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        auto sock = co_await acceptor.async_accept(net_awaitable[ec]);
+        if (ec) { st.error = "accept: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_malformed_response_server(std::move(sock), st, std::move(frame));
+        ioc.stop();
+    }, net::detached);
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        net::ip::tcp::socket sock(ioc);
+        std::vector<net::ip::tcp::endpoint> endpoints{
+            net::ip::tcp::endpoint(net::ip::make_address("127.0.0.1"), port)};
+        co_await net::async_connect(sock, endpoints, net_awaitable[ec]);
+        if (ec) { st.error = "connect: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_malformed_response_client(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    ioc.run();
+
+    BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
+    BOOST_CHECK_EQUAL(static_cast<int>(st.observed_frame_type),
+        static_cast<int>(frame_type::GOAWAY));
+    BOOST_CHECK_EQUAL(st.observed_error_code, static_cast<uint32_t>(expected));
+}
+
+// 回归: HEADERS 的 padding 长度 >= 载荷长度属连接错误 PROTOCOL_ERROR
+// (RFC 9113 §6.2), 而不是 COMPRESSION_ERROR.
+BOOST_AUTO_TEST_CASE(headers_invalid_padding_returns_protocol_error)
+{
+    uint8_t pad[1] = {5};  // pad length 5 >= 载荷长度 1
+    run_malformed_response_case(
+        build_raw_frame(1, static_cast<uint8_t>(frame_type::HEADERS),
+            static_cast<uint8_t>(frame_flag::PADDED), pad, sizeof(pad)),
+        http2_error_code::PROTOCOL_ERROR);
+}
+
+// 回归: PADDED 置位但缺少 Pad Length 字段属连接错误 FRAME_SIZE_ERROR
+// (RFC 9113 §4.2).
+BOOST_AUTO_TEST_CASE(headers_missing_pad_length_returns_frame_size_error)
+{
+    run_malformed_response_case(
+        build_raw_frame(1, static_cast<uint8_t>(frame_type::HEADERS),
+            static_cast<uint8_t>(frame_flag::PADDED), nullptr, 0),
+        http2_error_code::FRAME_SIZE_ERROR);
+}
+
+// 回归: PRIORITY 置位但不足 5 字节前缀属连接错误 FRAME_SIZE_ERROR
+// (RFC 9113 §4.2).
+BOOST_AUTO_TEST_CASE(headers_priority_too_short_returns_frame_size_error)
+{
+    uint8_t p[3] = {0, 0, 0};
+    run_malformed_response_case(
+        build_raw_frame(1, static_cast<uint8_t>(frame_type::HEADERS),
+            static_cast<uint8_t>(frame_flag::PRIORITY), p, sizeof(p)),
+        http2_error_code::FRAME_SIZE_ERROR);
+}
+
+// 同上, 但置位 END_HEADERS 走完整解码路径: 结果必须一致而非 COMPRESSION_ERROR.
+BOOST_AUTO_TEST_CASE(headers_full_missing_pad_length_returns_frame_size_error)
+{
+    run_malformed_response_case(
+        build_raw_frame(1, static_cast<uint8_t>(frame_type::HEADERS),
+            static_cast<uint8_t>(frame_flag::PADDED)
+                | static_cast<uint8_t>(frame_flag::END_HEADERS),
+            nullptr, 0),
+        http2_error_code::FRAME_SIZE_ERROR);
+}
+
+BOOST_AUTO_TEST_CASE(headers_full_priority_too_short_returns_frame_size_error)
+{
+    uint8_t p[3] = {0, 0, 0};
+    run_malformed_response_case(
+        build_raw_frame(1, static_cast<uint8_t>(frame_type::HEADERS),
+            static_cast<uint8_t>(frame_flag::PRIORITY)
+                | static_cast<uint8_t>(frame_flag::END_HEADERS),
+            p, sizeof(p)),
+        http2_error_code::FRAME_SIZE_ERROR);
+}
+
+BOOST_AUTO_TEST_CASE(headers_full_invalid_padding_returns_protocol_error)
+{
+    uint8_t pad[1] = {5};
+    run_malformed_response_case(
+        build_raw_frame(1, static_cast<uint8_t>(frame_type::HEADERS),
+            static_cast<uint8_t>(frame_flag::PADDED)
+                | static_cast<uint8_t>(frame_flag::END_HEADERS),
+            pad, sizeof(pad)),
+        http2_error_code::PROTOCOL_ERROR);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

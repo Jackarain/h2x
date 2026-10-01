@@ -846,6 +846,33 @@ namespace h2x {
             return std::nullopt;
         }
 
+        // 校验 HEADERS/PUSH_PROMISE 的 Padding/Priority 前缀, 同时给出头部块
+        // 的起始偏移与填充长度 (RFC 9113 §4.2/§6.2):
+        //   - PADDED/PRIORITY 前缀不足必需字节数 → FRAME_SIZE_ERROR
+        //   - pad length 超出前缀之后的剩余长度 → PROTOCOL_ERROR
+        // 返回 std::nullopt 表示合法.
+        static std::optional<http2_error_code> headers_prefix_error(
+            const uint8_t* payload, size_t plen, bool padded, bool priority,
+            size_t& offset, uint8_t& pad_len)
+        {
+            offset = 0;
+            pad_len = 0;
+            if (padded) {
+                if (plen < 1)
+                    return http2_error_code::FRAME_SIZE_ERROR;
+                pad_len = payload[0];
+                offset = 1;
+            }
+            if (priority) {
+                if (plen - offset < 5)
+                    return http2_error_code::FRAME_SIZE_ERROR;
+                offset += 5;
+            }
+            if (static_cast<size_t>(pad_len) > plen - offset)
+                return http2_error_code::PROTOCOL_ERROR;
+            return std::nullopt;
+        }
+
         net::awaitable<void> handle_frame(frame_codec& fc)
         {
             auto type = fc.type();
@@ -1110,6 +1137,18 @@ namespace h2x {
             hf.set_decoder_table(&dec_dynamic_table_, &dec_dynamic_table_size_,
                 &dec_dynamic_table_max_, settings_.header_table_size);
 
+            // 前缀字段必须先于 HPACK 解码校验: 前缀过短/padding 越界时
+            // unpack_headers 抛异常会被下方误判为 COMPRESSION_ERROR,
+            // 而 RFC 9113 §4.2/§6.2 要求 FRAME_SIZE_ERROR / PROTOCOL_ERROR.
+            size_t prefix_offset = 0;
+            uint8_t pad_len = 0;
+            if (auto err = headers_prefix_error(fc.payload(), fc.payload_size(),
+                    hf.padded_, hf.priority_, prefix_offset, pad_len)) {
+                co_await send_goaway(0, *err);
+                abort_ = true;
+                co_return;
+            }
+
             if (hf.end_headers_) {
                 // 完整头部块到达 — 执行完整 HPACK 解析.
                 bool hpack_error = false;
@@ -1177,27 +1216,9 @@ namespace h2x {
                 // 跳过 padding / priority 前缀 (与 unpack_headers 逻辑保持一致).
                 size_t offset = 0;
                 uint8_t pad_len = 0;
-                if (hf.padded_) {
-                    if (plen < 1) {
-                        co_await send_goaway(sid, http2_error_code::PROTOCOL_ERROR);
-                        abort_ = true;
-                        co_return;
-                    }
-                    pad_len = payload[0];
-                    offset += 1;
-                }
-                if (hf.priority_) {
-                    if (plen - offset < 5) {
-                        co_await send_goaway(sid, http2_error_code::PROTOCOL_ERROR);
-                        abort_ = true;
-                        co_return;
-                    }
-                    offset += 5;
-                }
-                // padding 必须整段落在前缀之后: offset + pad_len <= plen,
-                // 否则 payload + plen - pad_len 会早于 payload + offset.
-                if (static_cast<size_t>(pad_len) > plen - offset) {
-                    co_await send_goaway(sid, http2_error_code::PROTOCOL_ERROR);
+                if (auto err = headers_prefix_error(payload, plen, hf.padded_,
+                        hf.priority_, offset, pad_len)) {
+                    co_await send_goaway(0, *err);
                     abort_ = true;
                     co_return;
                 }
