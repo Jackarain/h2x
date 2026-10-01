@@ -41,6 +41,7 @@ struct connection_test_state {
     int dup_headers = 0;      // 同一头部块内自引用动态表索引解出的条数.
     uint8_t observed_frame_type = 0;   // 服务端观测到的客户端回帧类型.
     uint32_t observed_error_code = 0;  // 上述回帧携带的错误码 (RST/GOAWAY).
+    size_t streams_left = 0;           // 客户端空闲后仍被跟踪的流数量.
 };
 
 // ── 帧构建辅助 (模拟服务端) ──
@@ -278,6 +279,7 @@ static net::awaitable<void> run_mock_client(
         st.body_bytes += chunk.size();
     }
     st.clean_eof = true;
+    st.streams_left = conn->stream_count();
 
     conn->close();
     co_await conn->async_wait_pump(3s);
@@ -1242,6 +1244,7 @@ BOOST_AUTO_TEST_CASE(stream_release_after_empty_data_end_stream)
     BOOST_CHECK(st.headers_ok);
     BOOST_CHECK_EQUAL(st.body_bytes, 220u);
     BOOST_CHECK(st.clean_eof);
+    BOOST_CHECK_EQUAL(st.streams_left, 0u);
 }
 
 // 回归: CONTINUATION 分片累积时 padding 与前缀偏移必须匹配,

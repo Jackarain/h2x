@@ -372,7 +372,9 @@ namespace h2x {
                 co_return result;
             }
 
-            // 流已结束，返回空.
+            // 流已结束，返回空. 此处读端最后结束, 必须尝试释放流状态;
+            // handle_data_frame 内的释放会因 waiter 槽位非空而被跳过.
+            conn_->maybe_release_stream(stream_id_);
             co_return std::vector<uint8_t>{};
         }
 
