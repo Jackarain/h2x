@@ -630,9 +630,10 @@ namespace h2x {
                     break;
                 }
                 case settings_id::SETTINGS_MAX_FRAME_SIZE:
-                    // 取值范围 [2^14, 2^24-1] (RFC 7540 §6.5.2).
+                    // 取值范围 [2^14, 2^24-1], 越界属连接错误 PROTOCOL_ERROR
+                    // (RFC 9113 §6.5.2).
                     if (e.value_ < 16384 || e.value_ > 0xFFFFFF)
-                        return http2_error_code::FRAME_SIZE_ERROR;
+                        return http2_error_code::PROTOCOL_ERROR;
                     peer_max_frame_size_ = e.value_;
                     break;
                 default:

@@ -43,6 +43,7 @@ struct connection_test_state {
     uint32_t observed_error_code = 0;  // 上述回帧携带的错误码 (RST/GOAWAY).
     size_t streams_left = 0;           // 客户端空闲后仍被跟踪的流数量.
     bool handshake_failed = false;     // 握手是否按预期失败.
+    int handshake_errc = 0;            // 握手失败时的 error_code 数值.
     std::vector<uint8_t> header_prefix; // 客户端发出的首个头部块前缀.
 };
 
@@ -495,8 +496,9 @@ static std::vector<uint8_t> build_settings_entry(uint16_t id, uint32_t value)
     return buf;
 }
 
-// 服务端: 发送 MAX_FRAME_SIZE=0 的非法 SETTINGS.
-static net::awaitable<void> run_bad_settings_server(net::ip::tcp::socket sock)
+// 服务端: 发送一项指定取值的 SETTINGS, 用于校验对端设置合法性.
+static net::awaitable<void> run_bad_settings_server(
+    net::ip::tcp::socket sock, uint16_t id, uint32_t value)
 {
     boost::system::error_code ec;
 
@@ -506,8 +508,7 @@ static net::awaitable<void> run_bad_settings_server(net::ip::tcp::socket sock)
 
     (void)co_await read_frame(sock);   // 客户端 SETTINGS.
 
-    auto bad = build_settings_entry(
-        static_cast<uint16_t>(settings_id::SETTINGS_MAX_FRAME_SIZE), 0);
+    auto bad = build_settings_entry(id, value);
     co_await net::async_write(sock, net::buffer(bad), net_awaitable[ec]);
 
     // 若客户端错误地接受了非法设置, 会回 SETTINGS ACK 并等待本端 ACK;
@@ -517,7 +518,7 @@ static net::awaitable<void> run_bad_settings_server(net::ip::tcp::socket sock)
     co_await net::async_write(sock, net::buffer(ack), net_awaitable[ec]);
 }
 
-// 客户端: 非法 SETTINGS 必须导致握手失败.
+// 客户端: 非法 SETTINGS 必须导致握手失败, 并记录 error_code.
 static net::awaitable<void> run_bad_settings_client(
     net::ip::tcp::socket sock, connection_test_state& st)
 {
@@ -529,10 +530,11 @@ static net::awaitable<void> run_bad_settings_client(
     settings s;
     co_await conn->async_handshake(role::client, s, ec);
     if (!ec) {
-        st.error = "handshake unexpectedly succeeded with MAX_FRAME_SIZE=0";
+        st.error = "handshake unexpectedly succeeded with invalid settings";
         conn->close();
         co_return;
     }
+    st.handshake_errc = ec.value();
     conn->close();
 }
 
@@ -1033,7 +1035,7 @@ static net::awaitable<void> run_goaway_client(
         }
     }
 
-    // 非法 SETTINGS: MAX_FRAME_SIZE=0 → 服务端应 GOAWAY(FRAME_SIZE_ERROR).
+    // 非法 SETTINGS: MAX_FRAME_SIZE=0 → 服务端应 GOAWAY(PROTOCOL_ERROR).
     auto bad = build_settings_entry(
         static_cast<uint16_t>(settings_id::SETTINGS_MAX_FRAME_SIZE), 0);
     co_await net::async_write(sock, net::buffer(bad), net_awaitable[ec]);
@@ -1334,7 +1336,8 @@ BOOST_AUTO_TEST_CASE(large_headers_end_stream_over_continuation)
 }
 
 // 回归: 对端 SETTINGS_MAX_FRAME_SIZE 非法 (0) 时必须作为连接错误拒绝,
-// 不能被接受 (否则后续发送会因 max_payload=0 空转).
+// 且错误类型必须是 PROTOCOL_ERROR (RFC 9113 §6.5.2), 不能被接受
+// (否则后续发送会因 max_payload=0 空转).
 BOOST_AUTO_TEST_CASE(peer_settings_invalid_max_frame_size)
 {
     net::io_context ioc(1);
@@ -1354,7 +1357,8 @@ BOOST_AUTO_TEST_CASE(peer_settings_invalid_max_frame_size)
         boost::system::error_code ec;
         auto sock = co_await acceptor.async_accept(net_awaitable[ec]);
         if (ec) { st.error = "accept: " + ec.message(); ioc.stop(); co_return; }
-        co_await run_bad_settings_server(std::move(sock));
+        co_await run_bad_settings_server(std::move(sock),
+            static_cast<uint16_t>(settings_id::SETTINGS_MAX_FRAME_SIZE), 0);
     }, net::detached);
 
     net::co_spawn(ioc, [&]() -> net::awaitable<void> {
@@ -1371,6 +1375,8 @@ BOOST_AUTO_TEST_CASE(peer_settings_invalid_max_frame_size)
     ioc.run();
 
     BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
+    BOOST_CHECK_EQUAL(st.handshake_errc,
+        make_error_code(errc::protocol_error).value());
 }
 
 // 回归: 同一头部块内先用增量索引加入表项, 再引用该表项 (索引 62),
@@ -1675,7 +1681,7 @@ BOOST_AUTO_TEST_CASE(connection_error_goaway_is_delivered)
     BOOST_CHECK_EQUAL(static_cast<int>(st.observed_frame_type),
         static_cast<int>(frame_type::GOAWAY));
     BOOST_CHECK_EQUAL(st.observed_error_code,
-        static_cast<uint32_t>(http2_error_code::FRAME_SIZE_ERROR));
+        static_cast<uint32_t>(http2_error_code::PROTOCOL_ERROR));
 }
 // 回归: HEADERS 的 stream id 为 0 是连接错误 (RFC 7540 §6.2), 客户端
 // 不得把它当新流处理.
