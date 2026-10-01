@@ -848,6 +848,15 @@ namespace h2x {
                 co_return;
             }
 
+            // CONTINUATION 必须紧跟在未置 END_HEADERS 的 HEADERS/PUSH_PROMISE
+            // 之后; 没有在途头部块时收到 CONTINUATION 属连接错误
+            // (RFC 9113 §6.10).
+            if (type == frame_type::CONTINUATION && header_block_sid_ == 0) {
+                co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                abort_ = true;
+                co_return;
+            }
+
             // 帧长度不合法属连接错误: 回对应错误帧而不是静默断连.
             if (auto err = frame_length_error(type, fc.payload_size())) {
                 co_await send_goaway(0, *err);

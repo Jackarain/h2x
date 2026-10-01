@@ -2619,6 +2619,26 @@ BOOST_AUTO_TEST_CASE(connection_window_update_zero_increment_rejected)
         http2_error_code::PROTOCOL_ERROR);
 }
 
+
+// 回归: 没有在途头部块 (HEADERS/PUSH_PROMISE 未置 END_HEADERS) 时收到
+// CONTINUATION 属连接错误 PROTOCOL_ERROR (RFC 9113 §6.10).
+BOOST_AUTO_TEST_CASE(continuation_on_stream_zero_without_header_block_rejected)
+{
+    run_bad_frame_case(
+        build_raw_frame(0, static_cast<uint8_t>(frame_type::CONTINUATION),
+            static_cast<uint8_t>(frame_flag::END_HEADERS), nullptr, 0),
+        http2_error_code::PROTOCOL_ERROR);
+}
+
+// 回归: 已存在的流上, 若没有在途的头部块, CONTINUATION 同样是连接错误.
+BOOST_AUTO_TEST_CASE(continuation_without_header_block_on_stream_rejected)
+{
+    run_bad_frame_case(
+        build_raw_frame(1, static_cast<uint8_t>(frame_type::CONTINUATION),
+            static_cast<uint8_t>(frame_flag::END_HEADERS), nullptr, 0),
+        http2_error_code::PROTOCOL_ERROR);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace h2x
