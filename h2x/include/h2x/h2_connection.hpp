@@ -657,6 +657,18 @@ namespace h2x {
             return std::nullopt;
         }
 
+        // 判断流标识符是否仍处于 idle 状态 (对端尚未在其上发起流).
+        // 对端发起的流使用与本地相反的奇偶性; 本地已打开过的流由
+        // next_stream_id_ 界定 (RFC 9113 §5.1.1).
+        bool is_idle_stream(uint32_t sid) const
+        {
+            const bool peer_parity = (role_ == role::client)
+                ? (sid % 2 == 0) : (sid % 2 == 1);
+            return peer_parity
+                ? (sid > last_peer_stream_id_)
+                : (sid >= next_stream_id_);
+        }
+
         // 分配流 ID：客户端使用奇数，服务端使用偶数.
         // 流 ID 为 31 位; 超出 0x7FFFFFFF 时返回 0 表示空间耗尽 (RFC 7540 §5.1.1),
         // 由 async_request 发起 GOAWAY.
@@ -963,7 +975,13 @@ namespace h2x {
 
             auto it = streams_.find(sid);
             if (it == streams_.end()) {
-                // 流不存在，发送 RST_STREAM.
+                // 空闲流上收到 DATA 属连接错误 PROTOCOL_ERROR (RFC 9113 §5.1);
+                // 已关闭并被回收的流则回 RST_STREAM(STREAM_CLOSED).
+                if (is_idle_stream(sid)) {
+                    co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                    abort_ = true;
+                    co_return;
+                }
                 co_await send_rst_stream(sid, http2_error_code::STREAM_CLOSED);
                 co_return;
             }
@@ -1031,13 +1049,15 @@ namespace h2x {
 
             // 如果是新流 ID（服务端收到客户端请求）.
             if (it == streams_.end()) {
-                // 角色感知的流 ID 检查:
-                // - 服务端只能收到客户端发起的奇数流 ID
-                // - 客户端只能收到服务端发起的偶数流 ID (推送流)
-                if ((role_ == role::server && sid % 2 == 0) ||
-                    (role_ == role::client && sid % 2 == 1)) {
-                    // 违反 HTTP/2 协议, 连接错误 PROTOCOL_ERROR 后终止连接.
-                    co_await send_goaway(sid, http2_error_code::PROTOCOL_ERROR);
+                // 新流标识符必须严格递增, 且只能由对端经 HEADERS 发起:
+                // - 服务端只能接受客户端发起的奇数流, 且 id > last_peer_stream_id_
+                // - 客户端不能经 HEADERS 接受服务端发起的流 (必须经 PUSH_PROMISE)
+                // (RFC 9113 §5.1/§5.1.1).
+                const bool acceptable_new_stream =
+                    (role_ == role::server) && (sid % 2 == 1) &&
+                    (sid > last_peer_stream_id_);
+                if (!acceptable_new_stream) {
+                    co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
                     abort_ = true;
                     co_return;
                 }
@@ -1257,6 +1277,25 @@ namespace h2x {
             push_promise_frame ppf(fc.data_, fc.size_);
             auto promised_id = ppf.get_promised_stream_id();
 
+            // PUSH_PROMISE 只能由服务端发往客户端, 且接收方必须已启用推送
+            // (RFC 9113 §5.1/§6.6): 服务端收到, 或客户端已声明
+            // SETTINGS_ENABLE_PUSH=0 时收到, 均属连接错误.
+            if (fc.stream_id() == 0 || role_ == role::server ||
+                !settings_.enable_push) {
+                co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                abort_ = true;
+                co_return;
+            }
+
+            // promised stream id 必须是合法的下一个对端流标识符
+            // (偶数且严格递增, RFC 9113 §5.1.1/§6.6).
+            if (promised_id == 0 || promised_id % 2 != 0 ||
+                promised_id <= last_peer_stream_id_) {
+                co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                abort_ = true;
+                co_return;
+            }
+
             // 创建预留流.
             auto [it, ok] = streams_.emplace(promised_id, stream_state_data{});
             if (ok) {
@@ -1309,6 +1348,14 @@ namespace h2x {
             // WINDOW_UPDATE 负载必须恰为 4 字节 (RFC 7540 §6.9): 连接错误.
             if (fc.payload_size() != 4) {
                 co_await send_goaway(0, http2_error_code::FRAME_SIZE_ERROR);
+                abort_ = true;
+                co_return;
+            }
+
+            // 空闲流上收到 WINDOW_UPDATE 属连接错误 PROTOCOL_ERROR
+            // (RFC 9113 §5.1); 已关闭并被回收的流则可安全忽略 (RFC 9113 §6.9).
+            if (sid != 0 && is_idle_stream(sid)) {
+                co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
                 abort_ = true;
                 co_return;
             }

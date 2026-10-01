@@ -2639,6 +2639,64 @@ BOOST_AUTO_TEST_CASE(continuation_without_header_block_on_stream_rejected)
         http2_error_code::PROTOCOL_ERROR);
 }
 
+
+// ── 空闲流 / 流标识符 / 推送校验 (RFC 9113 §5.1, §5.1.1, §6.6) ──
+// 对照 nghttp2 session_on_data_received_fail_fast /
+// session_on_stream_window_update_received / on_request_headers_received /
+// on_push_promise_received 的校验路径.
+
+// 回归: 空闲流上收到 DATA 属连接错误 PROTOCOL_ERROR (RFC 9113 §5.1).
+BOOST_AUTO_TEST_CASE(data_on_idle_stream_rejected)
+{
+    run_bad_frame_case(
+        build_raw_frame(2, static_cast<uint8_t>(frame_type::DATA), 0,
+            nullptr, 0),
+        http2_error_code::PROTOCOL_ERROR);
+}
+
+// 回归: 空闲流上收到 WINDOW_UPDATE 属连接错误 PROTOCOL_ERROR
+// (RFC 9113 §5.1; nghttp2 "WINDOW_UPDATE to idle stream").
+BOOST_AUTO_TEST_CASE(window_update_on_idle_stream_rejected)
+{
+    uint8_t inc[4] = {0, 0, 0, 1};
+    run_bad_frame_case(
+        build_raw_frame(2, static_cast<uint8_t>(frame_type::WINDOW_UPDATE), 0,
+            inc, sizeof(inc)),
+        http2_error_code::PROTOCOL_ERROR);
+}
+
+// 回归: 客户端收到服务端在空闲流上直接发起的 HEADERS (未经 PUSH_PROMISE)
+// 属连接错误 PROTOCOL_ERROR (RFC 9113 §5.1).
+BOOST_AUTO_TEST_CASE(headers_on_idle_server_initiated_stream_rejected)
+{
+    run_bad_frame_case(
+        build_raw_frame(2, static_cast<uint8_t>(frame_type::HEADERS),
+            static_cast<uint8_t>(frame_flag::END_HEADERS), nullptr, 0),
+        http2_error_code::PROTOCOL_ERROR);
+}
+
+// 回归: 客户端已禁用推送 (SETTINGS_ENABLE_PUSH=0) 时收到 PUSH_PROMISE
+// 属连接错误 PROTOCOL_ERROR (RFC 9113 §6.6).
+BOOST_AUTO_TEST_CASE(push_promise_when_push_disabled_rejected)
+{
+    uint8_t payload[4] = {0, 0, 0, 2};  // promised stream id = 2
+    run_bad_frame_case(
+        build_raw_frame(1, static_cast<uint8_t>(frame_type::PUSH_PROMISE),
+            static_cast<uint8_t>(frame_flag::END_HEADERS), payload, sizeof(payload)),
+        http2_error_code::PROTOCOL_ERROR);
+}
+
+// 回归: PUSH_PROMISE 的流标识符为 0 属连接错误 PROTOCOL_ERROR
+// (RFC 9113 §6.6).
+BOOST_AUTO_TEST_CASE(push_promise_on_stream_zero_rejected)
+{
+    uint8_t payload[4] = {0, 0, 0, 2};
+    run_bad_frame_case(
+        build_raw_frame(0, static_cast<uint8_t>(frame_type::PUSH_PROMISE),
+            static_cast<uint8_t>(frame_flag::END_HEADERS), payload, sizeof(payload)),
+        http2_error_code::PROTOCOL_ERROR);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace h2x
