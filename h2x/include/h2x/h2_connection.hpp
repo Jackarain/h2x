@@ -961,6 +961,8 @@ namespace h2x {
                 if (!ok) co_return;
                 it = new_it;
                 it->second.stream_id = sid;
+                if (sid > last_peer_stream_id_)
+                    last_peer_stream_id_ = sid;
                 if (refused) {
                     it->second.refused = true;
                     it->second.state = stream_state::closed;
@@ -1081,7 +1083,22 @@ namespace h2x {
             rst_stream_frame rf(fc.data_, fc.size_);
 
             auto it = streams_.find(sid);
-            if (it != streams_.end()) {
+            if (it == streams_.end()) {
+                // 流不在表中: 可能是已关闭并被回收的流, 也可能是从未开启的
+                // 空闲流. 对空闲流发送 RST_STREAM 是连接错误 (RFC 9113 §6.4).
+                const bool peer_parity = (role_ == role::client)
+                    ? (sid % 2 == 0) : (sid % 2 == 1);
+                const bool idle = peer_parity
+                    ? (sid > last_peer_stream_id_)
+                    : (sid >= next_stream_id_);
+                if (idle) {
+                    co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                    abort_ = true;
+                    co_return;
+                }
+                co_return;
+            }
+            {
                 it->second.state = stream_state::closed;
                 it->second.reset_received = true;
 
@@ -1140,6 +1157,8 @@ namespace h2x {
                 it->second.stream_id = promised_id;
                 it->second.state = stream_state::reserved_remote;
                 it->second.is_remote_initiated = true;
+                if (promised_id > last_peer_stream_id_)
+                    last_peer_stream_id_ = promised_id;
             }
             co_return;
         }
@@ -1530,6 +1549,10 @@ namespace h2x {
         // 正在接收的头部块所属流 ID (0 表示当前无在途头部块).
         // HEADERS 未置 END_HEADERS 后, 只允许同流的 CONTINUATION 帧.
         uint32_t header_block_sid_ = 0;
+
+        // 对端已发起的最大流 ID, 用于判定 RST_STREAM 是否落在空闲流上
+        // (RFC 9113 §6.4): 高于该值的对端流从未开启, 属空闲流.
+        uint32_t last_peer_stream_id_ = 0;
 
         // 解码方向动态表 (对端编码器写入), 上限为本端 SETTINGS_HEADER_TABLE_SIZE.
         std::vector<header_entry> dec_dynamic_table_;
