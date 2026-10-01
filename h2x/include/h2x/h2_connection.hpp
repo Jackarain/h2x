@@ -120,7 +120,8 @@ namespace h2x {
         // 表示 HTTP/2 流.
         using stream_type = stream<connection<NextLayer>>;
 
-        // stream_type 你是我的好朋友, 我会对你敞开我的一切.
+        // stream 的实现位于 h2_stream.hpp, 需要访问 connection 的私有成员,
+        // 故声明为友元.
         friend stream_type;
 
         ////////////////////////////////////////////////////////////////////////////////
