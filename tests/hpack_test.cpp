@@ -663,8 +663,6 @@ BOOST_AUTO_TEST_CASE(hpack_unpack_rejects_bad_huffman_string)
 
 BOOST_AUTO_TEST_SUITE_END()
 
-BOOST_AUTO_TEST_SUITE(hpack_dynamic_table_size_update_decode)
-
 // 组装一个仅含 header block 的 HEADERS 帧 (END_HEADERS).
 static void build_headers_from_block(const std::vector<uint8_t>& block,
                                      std::vector<uint8_t>& out)
@@ -684,6 +682,8 @@ static header_entry make_entry(const std::string& name, const std::string& value
     e.hash_ = frame_header_hash(e);
     return e;
 }
+
+BOOST_AUTO_TEST_SUITE(hpack_dynamic_table_size_update_decode)
 
 BOOST_AUTO_TEST_CASE(size_update_shrinks_existing_table)
 {
@@ -830,6 +830,140 @@ BOOST_AUTO_TEST_CASE(shrink_updates_map_and_evicts_oldest)
     BOOST_CHECK_EQUAL(table[0].name_.value_or(""), "x-b");
     BOOST_CHECK_EQUAL(map.count(a.hash_), 0u);
     BOOST_CHECK_EQUAL(map[b.hash_], 0);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// ──────────────────────────────────────────────────────────────────────────────
+// HPACK 解码边界用例
+// 对照 nghttp2 的 test_nghttp2_hd_inflate_zero_length_huffman /
+// test_nghttp2_hd_huff_decode / test_nghttp2_hd_inflate_expect_table_size_update.
+// ──────────────────────────────────────────────────────────────────────────────
+
+BOOST_AUTO_TEST_SUITE(hpack_decode_edge_cases)
+
+BOOST_AUTO_TEST_CASE(huffman_decode_empty_input)
+{
+    // 零长度 Huffman 字符串合法: 解码结果为空 (RFC 7541 §5.2).
+    auto out = huffman_decode(std::span<const uint8_t>());
+    BOOST_CHECK(out.empty());
+
+    // H=1, 长度 0 的字符串字面量 (0x80) 同样合法.
+    uint8_t zero[] = {0x80};
+    std::vector<uint8_t> decoded;
+    int ret = hpack_unpack(std::span<const uint8_t>(zero), decoded);
+    BOOST_CHECK_EQUAL(ret, 1);
+    BOOST_CHECK(decoded.empty());
+}
+
+BOOST_AUTO_TEST_CASE(huffman_decode_rejects_premature_sequence)
+{
+    // 0x1f 开启了多字节码字, 但后续比特不足以构成完整码字, 属解码错误.
+    std::vector<uint8_t> truncated = {0x1f, 0xff};
+    BOOST_CHECK_THROW(huffman_decode(std::span<const uint8_t>(truncated)),
+        std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(header_block_value_zero_length_huffman)
+{
+    // 字面量无索引 + 新名字 "x" + 空 Huffman 值 (0x80):
+    // 解码结果应为一条 name="x"、value="" 的头部.
+    std::vector<uint8_t> block = {0x40, 0x01, 'x', 0x80};
+    std::vector<uint8_t> frame;
+    build_headers_from_block(block, frame);
+
+    std::vector<header_entry> table;
+    size_t table_size = 0;
+    size_t table_max = 4096;
+    headers_frame hf(frame.data(), frame.size(), false, &table);
+    hf.set_decoder_table(&table, &table_size, &table_max, 4096);
+    hf.unpack_headers();
+
+    BOOST_REQUIRE_EQUAL(hf.headers_.size(), 1u);
+    BOOST_CHECK_EQUAL(hf.headers_[0].name_.value_or("?"), "x");
+    BOOST_REQUIRE(hf.headers_[0].value_.has_value());
+    BOOST_CHECK(hf.headers_[0].value_->empty());
+}
+
+BOOST_AUTO_TEST_CASE(size_update_at_limit_accepted)
+{
+    // 新上限等于本端声明值属合法边界 (> 才非法).
+    std::vector<header_entry> table;
+    size_t table_size = 0;
+    size_t table_max = 4096;
+
+    std::vector<uint8_t> block;
+    auto packed = hpack_pack_integer(100, 5);
+    packed[0] |= 0x20;
+    block.insert(block.end(), packed.begin(), packed.end());
+
+    std::vector<uint8_t> frame;
+    build_headers_from_block(block, frame);
+
+    headers_frame hf(frame.data(), frame.size(), false, &table);
+    hf.set_decoder_table(&table, &table_size, &table_max, 100);
+    BOOST_CHECK_NO_THROW(hf.unpack_headers());
+    BOOST_CHECK_EQUAL(table_max, 100u);
+}
+
+BOOST_AUTO_TEST_CASE(size_update_min_then_final_accepted)
+{
+    // 先缩到 111 再提到 4096: 两次更新都位于块开头, 且均不超过本端上限,
+    // 属合法序列 (RFC 7541 §4.2; nghttp2 expect_table_size_update).
+    std::vector<header_entry> table;
+    table.push_back(make_entry("x-b", "2"));
+    table.push_back(make_entry("x-a", "1"));
+    size_t table_size = 72;
+    size_t table_max = 4096;
+
+    std::vector<uint8_t> block;
+    auto first = hpack_pack_integer(111, 5);
+    first[0] |= 0x20;
+    block.insert(block.end(), first.begin(), first.end());
+    auto second = hpack_pack_integer(4096, 5);
+    second[0] |= 0x20;
+    block.insert(block.end(), second.begin(), second.end());
+
+    std::vector<uint8_t> frame;
+    build_headers_from_block(block, frame);
+
+    headers_frame hf(frame.data(), frame.size(), false, &table);
+    hf.set_decoder_table(&table, &table_size, &table_max, 4096);
+    BOOST_CHECK_NO_THROW(hf.unpack_headers());
+
+    // 中间态 111 触发的驱逐不可回滚: 两条表项共 72 字节, 缩到 111 后
+    // 仍可容纳, 故最终最大上限为 4096 且表项保留.
+    BOOST_CHECK_EQUAL(table_max, 4096u);
+    BOOST_CHECK_EQUAL(table.size(), 2u);
+}
+
+BOOST_AUTO_TEST_CASE(size_update_shrink_to_zero_then_grow)
+{
+    // 缩到 0 会清空动态表, 之后再提到 4096 只恢复上限, 不恢复已驱逐表项.
+    std::vector<header_entry> table;
+    table.push_back(make_entry("x-b", "2"));
+    table.push_back(make_entry("x-a", "1"));
+    size_t table_size = 72;
+    size_t table_max = 4096;
+
+    std::vector<uint8_t> block;
+    auto first = hpack_pack_integer(0, 5);
+    first[0] |= 0x20;
+    block.insert(block.end(), first.begin(), first.end());
+    auto second = hpack_pack_integer(4096, 5);
+    second[0] |= 0x20;
+    block.insert(block.end(), second.begin(), second.end());
+
+    std::vector<uint8_t> frame;
+    build_headers_from_block(block, frame);
+
+    headers_frame hf(frame.data(), frame.size(), false, &table);
+    hf.set_decoder_table(&table, &table_size, &table_max, 4096);
+    BOOST_CHECK_NO_THROW(hf.unpack_headers());
+
+    BOOST_CHECK_EQUAL(table_max, 4096u);
+    BOOST_CHECK(table.empty());
+    BOOST_CHECK_EQUAL(table_size, 0u);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
