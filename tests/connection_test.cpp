@@ -2469,6 +2469,111 @@ BOOST_AUTO_TEST_CASE(invalid_huffman_header_block_returns_compression_error)
         http2_error_code::COMPRESSION_ERROR);
 }
 
+
+// ── 帧校验矩阵 (对照 nghttp2_frame_test.c 的 iv_check) ──
+// RFC 9113 §4.2/§6: 各帧类型的载荷长度与流标识符约束, 违反者属连接错误.
+// 参考 nghttp2 的 fuzz_target 与 session 校验路径, 这些分支此前没有连接级测试.
+
+BOOST_AUTO_TEST_CASE(rst_stream_bad_length_returns_frame_size_error)
+{
+    // RST_STREAM 载荷必须恰为 4 字节 (RFC 9113 §6.4).
+    uint8_t payload[3] = {0, 0, 0};
+    run_bad_frame_case(
+        build_raw_frame(1, static_cast<uint8_t>(frame_type::RST_STREAM), 0,
+            payload, sizeof(payload)),
+        http2_error_code::FRAME_SIZE_ERROR);
+}
+
+BOOST_AUTO_TEST_CASE(priority_bad_length_returns_frame_size_error)
+{
+    // PRIORITY 载荷必须恰为 5 字节 (RFC 9113 §6.3).
+    uint8_t payload[4] = {0, 0, 0, 0};
+    run_bad_frame_case(
+        build_raw_frame(1, static_cast<uint8_t>(frame_type::PRIORITY), 0,
+            payload, sizeof(payload)),
+        http2_error_code::FRAME_SIZE_ERROR);
+}
+
+BOOST_AUTO_TEST_CASE(goaway_bad_length_returns_frame_size_error)
+{
+    // GOAWAY 载荷至少 8 字节 (RFC 9113 §6.8).
+    uint8_t payload[7] = {0};
+    run_bad_frame_case(
+        build_raw_frame(0, static_cast<uint8_t>(frame_type::GOAWAY), 0,
+            payload, sizeof(payload)),
+        http2_error_code::FRAME_SIZE_ERROR);
+}
+
+BOOST_AUTO_TEST_CASE(push_promise_bad_length_returns_frame_size_error)
+{
+    // PUSH_PROMISE 载荷至少 4 字节 (RFC 9113 §6.6).
+    uint8_t payload[3] = {0, 0, 0};
+    run_bad_frame_case(
+        build_raw_frame(1, static_cast<uint8_t>(frame_type::PUSH_PROMISE),
+            static_cast<uint8_t>(frame_flag::END_HEADERS), payload, sizeof(payload)),
+        http2_error_code::FRAME_SIZE_ERROR);
+}
+
+BOOST_AUTO_TEST_CASE(window_update_bad_length_returns_frame_size_error)
+{
+    // WINDOW_UPDATE 载荷必须恰为 4 字节 (RFC 9113 §6.9).
+    uint8_t payload[3] = {0, 0, 1};
+    run_bad_frame_case(
+        build_raw_frame(0, static_cast<uint8_t>(frame_type::WINDOW_UPDATE), 0,
+            payload, sizeof(payload)),
+        http2_error_code::FRAME_SIZE_ERROR);
+}
+
+BOOST_AUTO_TEST_CASE(settings_bad_length_returns_frame_size_error)
+{
+    // SETTINGS 载荷长度必须是 6 的整数倍 (RFC 9113 §6.5).
+    uint8_t payload[7] = {0};
+    run_bad_frame_case(
+        build_raw_frame(0, static_cast<uint8_t>(frame_type::SETTINGS), 0,
+            payload, sizeof(payload)),
+        http2_error_code::FRAME_SIZE_ERROR);
+}
+
+BOOST_AUTO_TEST_CASE(rst_stream_on_stream_zero_rejected)
+{
+    // RST_STREAM 必须关联到具体流 (RFC 9113 §6.4).
+    uint8_t payload[4] = {0, 0, 0, 0};
+    run_bad_frame_case(
+        build_raw_frame(0, static_cast<uint8_t>(frame_type::RST_STREAM), 0,
+            payload, sizeof(payload)),
+        http2_error_code::PROTOCOL_ERROR);
+}
+
+BOOST_AUTO_TEST_CASE(priority_on_stream_zero_rejected)
+{
+    // PRIORITY 必须关联到具体流 (RFC 9113 §6.3).
+    uint8_t payload[5] = {0, 0, 0, 0, 16};
+    run_bad_frame_case(
+        build_raw_frame(0, static_cast<uint8_t>(frame_type::PRIORITY), 0,
+            payload, sizeof(payload)),
+        http2_error_code::PROTOCOL_ERROR);
+}
+
+BOOST_AUTO_TEST_CASE(ping_nonzero_stream_id_rejected)
+{
+    // PING 只作用于连接, 流标识符必须为 0 (RFC 9113 §6.7).
+    uint8_t payload[8] = {0};
+    run_bad_frame_case(
+        build_raw_frame(1, static_cast<uint8_t>(frame_type::PING), 0,
+            payload, sizeof(payload)),
+        http2_error_code::PROTOCOL_ERROR);
+}
+
+BOOST_AUTO_TEST_CASE(connection_window_update_zero_increment_rejected)
+{
+    // 连接级 WINDOW_UPDATE 增量为 0 是连接错误 (RFC 9113 §6.9).
+    uint8_t payload[4] = {0, 0, 0, 0};
+    run_bad_frame_case(
+        build_raw_frame(0, static_cast<uint8_t>(frame_type::WINDOW_UPDATE), 0,
+            payload, sizeof(payload)),
+        http2_error_code::PROTOCOL_ERROR);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace h2x
