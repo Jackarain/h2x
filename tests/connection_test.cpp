@@ -46,6 +46,7 @@ struct connection_test_state {
     int handshake_errc = 0;            // 握手失败时的 error_code 数值.
     std::vector<uint8_t> header_prefix; // 客户端发出的首个头部块前缀.
     std::string extra_header_value;    // 客户端解出的 x-pushed 头部值.
+    bool reader_returned = false;      // 阻塞的读取者是否已返回 (未被挂起).
 };
 
 // ── 帧构建辅助 (模拟服务端) ──
@@ -3261,6 +3262,119 @@ BOOST_AUTO_TEST_CASE(push_promise_header_block_updates_hpack_table)
 
     BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
     BOOST_CHECK_EQUAL(st.extra_header_value, "yes");
+}
+
+// 客户端: 请求后阻塞在 async_read_headers, 期望在连接错误时被唤醒.
+static net::awaitable<void> run_abort_wakeup_client(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    using conn_type = connection<net::ip::tcp::socket>;
+    auto conn = std::make_shared<conn_type>(std::move(sock));
+
+    co_await conn->async_handshake(role::client, settings{}, ec);
+    if (ec) { st.error = "client: handshake: " + ec.message(); co_return; }
+
+    auto req = co_await conn->async_request();
+    if (!req.has_value()) { st.error = "client: async_request failed"; co_return; }
+    auto stream = std::move(req.value());
+    ec = co_await stream.async_write_headers({
+        {":method", "GET"}, {":path", "/"}, {":scheme", "https"},
+        {":authority", "test.local"},
+    }, false);
+    if (ec) { st.error = "client: write headers: " + ec.message(); co_return; }
+
+    auto hdr = co_await stream.async_read_headers();
+    st.reader_returned = true;
+    if (!hdr.has_value()) {
+        st.observed_error_code = static_cast<uint32_t>(hdr.error().value());
+    }
+
+    conn->close();
+    co_await conn->async_wait_pump(3s);
+}
+
+// 服务端: 在读请求后发送畸形 HEADERS (引用不存在的动态表索引 62), 触发
+// 客户端 COMPRESSION_ERROR; 随后等待客户端的 GOAWAY 并留出唤醒时间.
+static net::awaitable<void> run_abort_wakeup_server(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    std::vector<uint8_t> preface(24);
+    co_await net::async_read(sock, net::buffer(preface), net_awaitable[ec]);
+    if (ec) { st.error = "server: read preface: " + ec.message(); co_return; }
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no settings"; co_return; }
+    auto sf = build_settings_frame(false);
+    co_await net::async_write(sock, net::buffer(sf), net_awaitable[ec]);
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no settings ack"; co_return; }
+    auto sa = build_settings_frame(true);
+    co_await net::async_write(sock, net::buffer(sa), net_awaitable[ec]);
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no request"; co_return; }
+
+    uint8_t bad[1] = {0xBE};  // 索引 62: 动态表为空, 解码失败.
+    auto rf = build_raw_frame(1, static_cast<uint8_t>(frame_type::HEADERS),
+        static_cast<uint8_t>(frame_flag::END_HEADERS), bad, sizeof(bad));
+    co_await net::async_write(sock, net::buffer(rf), net_awaitable[ec]);
+
+    for (int i = 0; i < 4; ++i) {
+        auto f = co_await read_frame(sock);
+        if (f.size() < 9) break;
+        if (f[3] == static_cast<uint8_t>(frame_type::GOAWAY)) {
+            st.observed_frame_type = f[3];
+            break;
+        }
+    }
+
+    net::steady_timer timer(co_await net::this_coro::executor);
+    timer.expires_after(300ms);
+    co_await timer.async_wait(net_awaitable[ec]);
+    sock.close();
+}
+
+// 回归: 连接因协议/压缩错误中止时, 阻塞在流读取上的调用者必须被唤醒并
+// 拿到错误, 而不是永久挂在等待者上.
+BOOST_AUTO_TEST_CASE(connection_error_wakes_pending_reader)
+{
+    net::io_context ioc(1);
+    connection_test_state st;
+
+    net::ip::tcp::acceptor acceptor(
+        ioc, net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    auto port = acceptor.local_endpoint().port();
+
+    net::steady_timer watchdog(ioc);
+    watchdog.expires_after(10s);
+    watchdog.async_wait([&](boost::system::error_code ec) {
+        if (!ec) { st.error = "test timeout"; ioc.stop(); }
+    });
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        auto sock = co_await acceptor.async_accept(net_awaitable[ec]);
+        if (ec) { st.error = "accept: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_abort_wakeup_server(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        net::ip::tcp::socket sock(ioc);
+        std::vector<net::ip::tcp::endpoint> endpoints{
+            net::ip::tcp::endpoint(net::ip::make_address("127.0.0.1"), port)};
+        co_await net::async_connect(sock, endpoints, net_awaitable[ec]);
+        if (ec) { st.error = "connect: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_abort_wakeup_client(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    ioc.run();
+
+    BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
+    BOOST_CHECK_MESSAGE(st.reader_returned, "pending reader was not woken");
+    BOOST_CHECK_EQUAL(static_cast<int>(st.observed_frame_type),
+        static_cast<int>(frame_type::GOAWAY));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
