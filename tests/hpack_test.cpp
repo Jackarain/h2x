@@ -615,6 +615,54 @@ BOOST_AUTO_TEST_SUITE_END()
 // 解码方向动态表大小更新 (RFC 7541 §4.2/§6.3)
 // ──────────────────────────────────────────────────────────────────────────────
 
+BOOST_AUTO_TEST_SUITE(hpack_huffman_validation)
+
+BOOST_AUTO_TEST_CASE(decode_rejects_invalid_padding)
+{
+    // 0x18 = "a" 的 5 bit 码字 (00011) + 000 填充; 填充必须为 1.
+    std::vector<uint8_t> bad = {0x18};
+    BOOST_CHECK_THROW(huffman_decode(std::span<const uint8_t>(bad)),
+        std::runtime_error);
+
+    // 0x00 同样以 0 填充结束, 非法.
+    std::vector<uint8_t> bad2 = {0x00};
+    BOOST_CHECK_THROW(huffman_decode(std::span<const uint8_t>(bad2)),
+        std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(decode_rejects_eos_symbol)
+{
+    // EOS 码字是 30 个 1 (RFC 7541 §5.2), 不允许出现在头部块中.
+    // 30 个 1 + 2 个 1 填充 = 0xff 0xff 0xff 0xff.
+    std::vector<uint8_t> eos = {0xff, 0xff, 0xff, 0xff};
+    BOOST_CHECK_THROW(huffman_decode(std::span<const uint8_t>(eos)),
+        std::runtime_error);
+
+    std::vector<uint8_t> eos2 = {0x3f, 0xff, 0xff, 0xff};
+    BOOST_CHECK_THROW(huffman_decode(std::span<const uint8_t>(eos2)),
+        std::runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(decode_accepts_valid_padding)
+{
+    // "a" = 00011, 用 3 个 1 填充 → 0x1f.
+    std::vector<uint8_t> ok = {0x1f};
+    auto out = huffman_decode(std::span<const uint8_t>(ok));
+    BOOST_REQUIRE_EQUAL(out.size(), 1u);
+    BOOST_CHECK_EQUAL(static_cast<int>(out[0]), 'a');
+}
+
+BOOST_AUTO_TEST_CASE(hpack_unpack_rejects_bad_huffman_string)
+{
+    // H=1, 长度 1, 数据 0x18 (非法填充).
+    uint8_t buf[] = {0x81, 0x18};
+    std::vector<uint8_t> decoded;
+    int ret = hpack_unpack(std::span<const uint8_t>(buf), decoded);
+    BOOST_CHECK_EQUAL(ret, -1);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
 BOOST_AUTO_TEST_SUITE(hpack_dynamic_table_size_update_decode)
 
 // 组装一个仅含 header block 的 HEADERS 帧 (END_HEADERS).

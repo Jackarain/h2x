@@ -195,18 +195,34 @@ namespace h2x {
      */
     static std::vector<uint8_t> huffman_decode(std::span<const uint8_t> encoded)
     {
+        // 表中的状态 256 是死状态 (仅自环, 不产生符号), 对应被 RFC 7541
+        // §5.2 禁止出现在头部块中的 EOS 码字 (30 个 1).
+        constexpr uint16_t huffman_fail_state = 256;
+
         huffman_node t = { 0, 1, 0};
         std::vector<uint8_t> result;
 
         for (uint8_t ch : encoded) {
             t = global_huffman_tree[t.fstate][ch >> 4];
+            if (t.fstate == huffman_fail_state) {
+                throw std::runtime_error("huffman_decode: invalid huffman code");
+            }
             if (t.flags & 2) {
                 result.push_back(t.sym);
             }
             t = global_huffman_tree[t.fstate][ch & 0xf];
+            if (t.fstate == huffman_fail_state) {
+                throw std::runtime_error("huffman_decode: invalid huffman code");
+            }
             if (t.flags & 2) {
                 result.push_back(t.sym);
             }
+        }
+
+        // 结束状态必须带 ACCEPTED 标志 (bit0): 即尾部填充位全为 1 且不足
+        // 8 bit, 否则填充非法 (RFC 7541 §5.2).
+        if (!(t.flags & 1)) {
+            throw std::runtime_error("huffman_decode: invalid padding");
         }
 
         return result;
@@ -373,7 +389,12 @@ namespace h2x {
         }
 
         if (encoded[0] & 0b10000000) {
-            result = huffman_decode(encoded.subspan(ret, len));
+            // 非法 Huffman 码字/填充: 保持本函数 "返回 -1 表示失败" 的约定.
+            try {
+                result = huffman_decode(encoded.subspan(ret, len));
+            } catch (const std::exception&) {
+                return -1;
+            }
         } else {
             result.insert(result.end(), encoded.begin() + ret, encoded.begin() + ret + len);
         }

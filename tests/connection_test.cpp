@@ -2455,6 +2455,20 @@ BOOST_AUTO_TEST_CASE(encoder_emits_dynamic_table_size_update)
     BOOST_CHECK_EQUAL(static_cast<int>(st.header_prefix[0]), 0x20);
 }
 
+// 回归: 头部块中非法 Huffman 填充/码字属解码错误, 必须回
+// GOAWAY(COMPRESSION_ERROR) (RFC 9113 §4.3, RFC 7541 §5.2).
+BOOST_AUTO_TEST_CASE(invalid_huffman_header_block_returns_compression_error)
+{
+    // 0x88 = :status 200 (静态索引 8);
+    // 0x01 = 无索引字面量, 名字索引 1 (:authority);
+    // 0x81 0x18 = H=1 长度 1 的 Huffman 字符串, 填充非法.
+    uint8_t block[4] = {0x88, 0x01, 0x81, 0x18};
+    run_bad_frame_case(
+        build_raw_frame(1, static_cast<uint8_t>(frame_type::HEADERS),
+            static_cast<uint8_t>(frame_flag::END_HEADERS), block, sizeof(block)),
+        http2_error_code::COMPRESSION_ERROR);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace h2x
