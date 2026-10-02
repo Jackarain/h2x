@@ -1753,7 +1753,7 @@ namespace h2x {
 
                     // 分派帧处理.
                     co_await handle_frame(fc);
-                } catch (const std::exception&) {
+                } catch (const std::runtime_error&) {
                     // 防止 handle_frame (或其调用的 send_control_frame /
                     // pack_payload 等) 抛出异常时, pump_in 直接退出而跳过
                     // 下方的清理逻辑, 导致 pump_out 永久阻塞在
@@ -1766,6 +1766,11 @@ namespace h2x {
                         enqueue_goaway(0, http2_error_code::PROTOCOL_ERROR);
                         abort_ = true;
                     }
+                    break;
+                } catch (const std::exception&) {
+                    // 非协议性异常 (如内存不足): 仅中止连接并退出循环,
+                    // 不上报 PROTOCOL_ERROR, 避免把系统级故障误判为对端违规.
+                    abort_ = true;
                     break;
                 }
             }
