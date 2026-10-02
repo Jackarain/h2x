@@ -1215,12 +1215,6 @@ namespace h2x {
                 wake_waiter(accept_waiter_);
             } else {
                 // 头部块有后续 CONTINUATION 帧 — 暂存原始 payload.
-                // 上一个头部块尚未以 CONTINUATION 结束又收到新的 HEADERS → 协议错误.
-                if (sd.headers_in_progress) {
-                    co_await send_goaway(sid, http2_error_code::PROTOCOL_ERROR);
-                    abort_ = true;
-                    co_return;
-                }
                 sd.headers_in_progress = true;
                 header_block_sid_ = sid;
                 sd.pending_end_stream = hf.end_stream_;
