@@ -1315,6 +1315,46 @@ namespace h2x {
             co_return;
         }
 
+        // 解码一个完整的头部块, 维持连接级 HPACK 动态表 (RFC 9113 §4.3).
+        // out 非空时把解出的字段追加到该流; 返回 false 表示 HPACK 数据损坏.
+        bool decode_header_block(uint32_t assoc_sid, const uint8_t* block,
+                                 size_t len, stream_state_data* out)
+        {
+            if (len == 0)
+                return true;
+
+            // 合成的 HEADERS 帧头只能表示 24 位负载长度.
+            if (len > 0xFFFFFF)
+                return false;
+
+            std::vector<uint8_t> tmp(len + 9, 0);
+            tmp[3] = static_cast<uint8_t>(frame_type::HEADERS);
+            tmp[4] = static_cast<uint8_t>(frame_flag::END_HEADERS);
+            tmp[0] = (len >> 16) & 0xFF;
+            tmp[1] = (len >> 8) & 0xFF;
+            tmp[2] = len & 0xFF;
+            tmp[5] = (assoc_sid >> 24) & 0xFF;
+            tmp[6] = (assoc_sid >> 16) & 0xFF;
+            tmp[7] = (assoc_sid >> 8) & 0xFF;
+            tmp[8] = assoc_sid & 0xFF;
+            std::memcpy(tmp.data() + 9, block, len);
+
+            try {
+                headers_frame hf(tmp.data(), tmp.size(), false, &dec_dynamic_table_);
+                hf.set_decoder_table(&dec_dynamic_table_, &dec_dynamic_table_size_,
+                    &dec_dynamic_table_max_, settings_.header_table_size);
+                hf.unpack_headers();
+                if (out) {
+                    for (auto& h : hf.headers_) {
+                        out->headers.emplace_back(h);
+                    }
+                }
+            } catch (const std::exception&) {
+                return false;
+            }
+            return true;
+        }
+
         net::awaitable<void> handle_push_promise_frame(frame_codec& fc)
         {
             push_promise_frame ppf(fc.data_, fc.size_);
@@ -1363,35 +1403,11 @@ namespace h2x {
             // 不消费推送也必须解码, 否则后续 HEADERS 解码会失步
             // (RFC 9113 §4.3/§6.6).
             const auto& frag = ppf.get_header_block_fragment();
-            if (!frag.empty()) {
-                std::vector<uint8_t> tmp(frag.size() + 9, 0);
-                tmp[3] = static_cast<uint8_t>(frame_type::HEADERS);
-                tmp[4] = static_cast<uint8_t>(frame_flag::END_HEADERS);
-                tmp[0] = (frag.size() >> 16) & 0xFF;
-                tmp[1] = (frag.size() >> 8) & 0xFF;
-                tmp[2] = frag.size() & 0xFF;
-                tmp[5] = (sid >> 24) & 0xFF;
-                tmp[6] = (sid >> 16) & 0xFF;
-                tmp[7] = (sid >> 8) & 0xFF;
-                tmp[8] = sid & 0xFF;
-                std::memcpy(tmp.data() + 9, frag.data(), frag.size());
-
-                bool hpack_error = false;
-                try {
-                    headers_frame hf(tmp.data(), tmp.size(), false,
-                        &dec_dynamic_table_);
-                    hf.set_decoder_table(&dec_dynamic_table_,
-                        &dec_dynamic_table_size_, &dec_dynamic_table_max_,
-                        settings_.header_table_size);
-                    hf.unpack_headers();
-                } catch (const std::exception&) {
-                    hpack_error = true;
-                }
-                if (hpack_error) {
-                    co_await send_goaway(sid, http2_error_code::COMPRESSION_ERROR);
-                    abort_ = true;
-                    co_return;
-                }
+            if (!frag.empty() &&
+                !decode_header_block(sid, frag.data(), frag.size(), nullptr)) {
+                co_await send_goaway(sid, http2_error_code::COMPRESSION_ERROR);
+                abort_ = true;
+                co_return;
             }
 
             // 创建预留流.
@@ -1551,36 +1567,9 @@ namespace h2x {
                 frag.begin(), frag.end());
 
             if (cf.is_end_headers()) {
-                // 最后一块到达 — 构造合成 HEADERS 帧来解析完整头部块.
-                auto total = sd.pending_header_block.size();
-                std::vector<uint8_t> tmp(total + 9);
-                tmp[3] = static_cast<uint8_t>(frame_type::HEADERS);
-                tmp[4] = static_cast<uint8_t>(frame_flag::END_HEADERS);
-                tmp[0] = (total >> 16) & 0xFF;
-                tmp[1] = (total >> 8) & 0xFF;
-                tmp[2] = total & 0xFF;
-                tmp[5] = (sid >> 24) & 0xFF;
-                tmp[6] = (sid >> 16) & 0xFF;
-                tmp[7] = (sid >> 8) & 0xFF;
-                tmp[8] = sid & 0xFF;
-                std::memcpy(tmp.data() + 9, sd.pending_header_block.data(), total);
-
-                // 解析累积的完整头部块，若 HPACK 数据损坏则发送 GOAWAY.
-                bool hpack_error = false;
-                try {
-                    headers_frame cont_hf(tmp.data(), tmp.size(), false, &dec_dynamic_table_);
-                    cont_hf.set_decoder_table(&dec_dynamic_table_, &dec_dynamic_table_size_,
-                        &dec_dynamic_table_max_, settings_.header_table_size);
-                    cont_hf.unpack_headers();
-
-                    for (auto& h : cont_hf.headers_) {
-                        sd.headers.emplace_back(h);
-                    }
-                } catch (const std::exception&) {
-                    hpack_error = true;
-                }
-
-                if (hpack_error) {
+                // 最后一块到达 — 解析累积的完整头部块.
+                if (!decode_header_block(sid, sd.pending_header_block.data(),
+                        sd.pending_header_block.size(), &sd)) {
                     co_await send_goaway(sid, http2_error_code::COMPRESSION_ERROR);
                     abort_ = true;
                     co_return;
