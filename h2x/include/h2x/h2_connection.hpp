@@ -878,7 +878,6 @@ namespace h2x {
         {
             auto type = fc.type();
             auto sid = fc.stream_id();
-            auto flags = fc.flags();
 
             // 头部块在途期间 (HEADERS 未置 END_HEADERS), 只允许同一流上的
             // CONTINUATION 帧, 其它任何帧都是连接错误 (RFC 9113 §6.2/§6.10).
@@ -945,7 +944,7 @@ namespace h2x {
                 co_await handle_headers_frame(fc);
                 break;
             case frame_type::PRIORITY:
-                co_await handle_priority_frame(fc);
+                co_await handle_priority_frame();
                 break;
             case frame_type::RST_STREAM:
                 co_await handle_rst_stream_frame(fc);
@@ -1248,7 +1247,7 @@ namespace h2x {
             co_return;
         }
 
-        net::awaitable<void> handle_priority_frame(frame_codec& fc)
+        net::awaitable<void> handle_priority_frame()
         {
             // PRIORITY 帧在 RFC 7540 中可接收但不必须做任何事.
             co_return;
@@ -1776,7 +1775,7 @@ namespace h2x {
 
                     // 分派帧处理.
                     co_await handle_frame(fc);
-                } catch (const std::exception& e) {
+                } catch (const std::exception&) {
                     // 防止 handle_frame (或其调用的 send_control_frame /
                     // pack_payload 等) 抛出异常时, pump_in 直接退出而跳过
                     // 下方的清理逻辑, 导致 pump_out 永久阻塞在

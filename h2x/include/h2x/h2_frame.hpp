@@ -887,7 +887,7 @@ namespace h2x {
                     throw std::runtime_error("headers_frame: insufficient data for priority");
                 }
 
-                int nbytes = parse_priority(payload, payload_size);
+                int nbytes = parse_priority(payload);
 
                 payload += nbytes;
                 payload_size -= nbytes;
@@ -910,7 +910,7 @@ namespace h2x {
             }
         }
 
-        int parse_priority(const uint8_t* payload, size_t)
+        int parse_priority(const uint8_t* payload)
         {
             // 读取 stream dependency（4 字节）
             uint32_t dep = read_uint32(payload);
