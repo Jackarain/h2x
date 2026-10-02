@@ -1402,14 +1402,12 @@ namespace h2x {
             }
 
             // 创建预留流.
-            auto [it, ok] = streams_.emplace(promised_id, stream_state_data{});
-            if (ok) {
-                it->second.stream_id = promised_id;
-                it->second.state = stream_state::reserved_remote;
-                it->second.is_remote_initiated = true;
-                if (promised_id > last_peer_stream_id_)
-                    last_peer_stream_id_ = promised_id;
-            }
+            auto it = streams_.emplace(promised_id, stream_state_data{}).first;
+            it->second.stream_id = promised_id;
+            it->second.state = stream_state::reserved_remote;
+            it->second.is_remote_initiated = true;
+            if (promised_id > last_peer_stream_id_)
+                last_peer_stream_id_ = promised_id;
             co_return;
         }
 
