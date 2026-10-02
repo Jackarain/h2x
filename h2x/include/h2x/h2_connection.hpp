@@ -1262,12 +1262,7 @@ namespace h2x {
             if (it == streams_.end()) {
                 // 流不在表中: 可能是已关闭并被回收的流, 也可能是从未开启的
                 // 空闲流. 对空闲流发送 RST_STREAM 是连接错误 (RFC 9113 §6.4).
-                const bool peer_parity = (role_ == role::client)
-                    ? (sid % 2 == 0) : (sid % 2 == 1);
-                const bool idle = peer_parity
-                    ? (sid > last_peer_stream_id_)
-                    : (sid >= next_stream_id_);
-                if (idle) {
+                if (is_idle_stream(sid)) {
                     co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
                     abort_ = true;
                     co_return;
