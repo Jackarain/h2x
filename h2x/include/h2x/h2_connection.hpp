@@ -1121,9 +1121,7 @@ namespace h2x {
 
                 // 即使要拒绝该流, 也必须先解码其头部块, 以维持连接级 HPACK
                 // 动态表状态 (RFC 7540 §4.3); 故先登记流状态承载解码, 稍后拒绝.
-                auto [new_it, ok] = streams_.emplace(sid, stream_state_data{});
-                if (!ok) co_return;
-                it = new_it;
+                it = streams_.emplace(sid, stream_state_data{}).first;
                 it->second.stream_id = sid;
                 if (sid > last_peer_stream_id_)
                     last_peer_stream_id_ = sid;
