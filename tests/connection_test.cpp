@@ -3264,6 +3264,96 @@ BOOST_AUTO_TEST_CASE(push_promise_header_block_updates_hpack_table)
     BOOST_CHECK_EQUAL(st.extra_header_value, "yes");
 }
 
+// 服务端: 与 run_push_hpack_server 相同, 但把 PUSH_PROMISE 头部块拆到
+// CONTINUATION, 且在字段中间切开 (split=6), 回归分片 PUSH_PROMISE 的 HPACK 同步.
+static net::awaitable<void> run_fragmented_push_hpack_server(
+    net::ip::tcp::socket sock, connection_test_state& st)
+{
+    boost::system::error_code ec;
+
+    std::vector<uint8_t> preface(24);
+    co_await net::async_read(sock, net::buffer(preface), net_awaitable[ec]);
+    if (ec) { st.error = "server: read preface: " + ec.message(); co_return; }
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no settings"; co_return; }
+    auto sf = build_settings_frame(false);
+    co_await net::async_write(sock, net::buffer(sf), net_awaitable[ec]);
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no settings ack"; co_return; }
+    auto sa = build_settings_frame(true);
+    co_await net::async_write(sock, net::buffer(sa), net_awaitable[ec]);
+    if ((co_await read_frame(sock)).empty()) { st.error = "server: no request"; co_return; }
+
+    // 字面量增量索引: 新增 "x-pushed: yes"; 头部块在字段中间被切开.
+    const uint8_t block[] = {
+        0x40, 0x08, 'x', '-', 'p', 'u', 's', 'h', 'e', 'd', 0x03, 'y', 'e', 's'};
+    const size_t split = 6;
+
+    std::vector<uint8_t> pp(4 + split, 0);
+    pp[3] = 2; // promised stream id = 2
+    std::memcpy(pp.data() + 4, block, split);
+    auto ppf = build_raw_frame(1, static_cast<uint8_t>(frame_type::PUSH_PROMISE), 0,
+        pp.data(), pp.size());
+    co_await net::async_write(sock, net::buffer(ppf), net_awaitable[ec]);
+
+    auto cont = build_raw_frame(1, static_cast<uint8_t>(frame_type::CONTINUATION),
+        static_cast<uint8_t>(frame_flag::END_HEADERS), block + split,
+        sizeof(block) - split);
+    co_await net::async_write(sock, net::buffer(cont), net_awaitable[ec]);
+
+    // 响应: :status 200 (0x88) + 索引 62 (0xBE), END_HEADERS|END_STREAM.
+    uint8_t hdrs[2] = {0x88, 0xBE};
+    auto rf = build_raw_frame(1, static_cast<uint8_t>(frame_type::HEADERS),
+        static_cast<uint8_t>(frame_flag::END_HEADERS)
+            | static_cast<uint8_t>(frame_flag::END_STREAM),
+        hdrs, sizeof(hdrs));
+    co_await net::async_write(sock, net::buffer(rf), net_awaitable[ec]);
+
+    auto f = co_await read_frame(sock);
+    (void)f;
+    sock.close();
+}
+
+// 回归: PUSH_PROMISE 头部块被拆到 CONTINUATION 时仍须正确解码并同步动态表,
+// 否则后续引用该表项的 HEADERS 解码会失步 (RFC 9113 §6.6/§6.10/§4.3).
+BOOST_AUTO_TEST_CASE(push_promise_fragmented_header_block_updates_hpack_table)
+{
+    net::io_context ioc(1);
+    connection_test_state st;
+
+    net::ip::tcp::acceptor acceptor(
+        ioc, net::ip::tcp::endpoint(net::ip::tcp::v4(), 0));
+    auto port = acceptor.local_endpoint().port();
+
+    net::steady_timer watchdog(ioc);
+    watchdog.expires_after(10s);
+    watchdog.async_wait([&](boost::system::error_code ec) {
+        if (!ec) { st.error = "test timeout"; ioc.stop(); }
+    });
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        auto sock = co_await acceptor.async_accept(net_awaitable[ec]);
+        if (ec) { st.error = "accept: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_fragmented_push_hpack_server(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    net::co_spawn(ioc, [&]() -> net::awaitable<void> {
+        boost::system::error_code ec;
+        net::ip::tcp::socket sock(ioc);
+        std::vector<net::ip::tcp::endpoint> endpoints{
+            net::ip::tcp::endpoint(net::ip::make_address("127.0.0.1"), port)};
+        co_await net::async_connect(sock, endpoints, net_awaitable[ec]);
+        if (ec) { st.error = "connect: " + ec.message(); ioc.stop(); co_return; }
+        co_await run_push_hpack_client(std::move(sock), st);
+        ioc.stop();
+    }, net::detached);
+
+    ioc.run();
+
+    BOOST_CHECK_MESSAGE(st.error.empty(), st.error);
+    BOOST_CHECK_EQUAL(st.extra_header_value, "yes");
+}
+
 // 客户端: 请求后阻塞在 async_read_headers, 期望在连接错误时被唤醒.
 static net::awaitable<void> run_abort_wakeup_client(
     net::ip::tcp::socket sock, connection_test_state& st)
@@ -3400,6 +3490,37 @@ BOOST_AUTO_TEST_CASE(window_update_on_reserved_stream_rejected)
         {build_push_promise_frame(1, 2, block, sizeof(block)),
          build_raw_frame(2, static_cast<uint8_t>(frame_type::WINDOW_UPDATE), 0,
              inc, sizeof(inc))},
+        http2_error_code::PROTOCOL_ERROR);
+}
+
+// 回归: PUSH_PROMISE 头部块在途期间只允许同流 CONTINUATION, 其它帧属
+// 连接错误 PROTOCOL_ERROR (RFC 9113 §6.6/§6.10).
+BOOST_AUTO_TEST_CASE(push_promise_fragmented_interleaved_frame_rejected)
+{
+    std::vector<uint8_t> pp(5, 0);
+    pp[3] = 2;    // promised stream id = 2
+    pp[4] = 0x82; // :method GET
+    uint8_t d[1] = {'x'};
+    run_push_reject_case(
+        {build_raw_frame(1, static_cast<uint8_t>(frame_type::PUSH_PROMISE), 0,
+             pp.data(), pp.size()),
+         build_raw_frame(1, static_cast<uint8_t>(frame_type::DATA), 0,
+             d, sizeof(d))},
+        http2_error_code::PROTOCOL_ERROR);
+}
+
+// 回归: CONTINUATION 必须与在途 PUSH_PROMISE 位于同一流 (RFC 9113 §6.10).
+BOOST_AUTO_TEST_CASE(push_promise_fragmented_wrong_stream_continuation_rejected)
+{
+    std::vector<uint8_t> pp(5, 0);
+    pp[3] = 2;    // promised stream id = 2
+    pp[4] = 0x82; // :method GET
+    uint8_t rest[1] = {0x84}; // :path /
+    run_push_reject_case(
+        {build_raw_frame(1, static_cast<uint8_t>(frame_type::PUSH_PROMISE), 0,
+             pp.data(), pp.size()),
+         build_raw_frame(3, static_cast<uint8_t>(frame_type::CONTINUATION),
+             static_cast<uint8_t>(frame_flag::END_HEADERS), rest, sizeof(rest))},
         http2_error_code::PROTOCOL_ERROR);
 }
 
