@@ -1380,14 +1380,15 @@ namespace h2x {
                 abort_ = true;
                 co_return;
             }
-            if (auto sit = streams_.find(sid); sit != streams_.end()) {
-                const auto state = sit->second.state;
-                if (state != stream_state::open &&
-                    state != stream_state::half_closed_local) {
-                    co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
-                    abort_ = true;
-                    co_return;
-                }
+            // 关联流必须存在且处于 open / half-closed(local); 已回收的流
+            // 视为 closed, 在其上发送 PUSH_PROMISE 属连接错误.
+            auto sit = streams_.find(sid);
+            if (sit == streams_.end() ||
+                (sit->second.state != stream_state::open &&
+                 sit->second.state != stream_state::half_closed_local)) {
+                co_await send_goaway(0, http2_error_code::PROTOCOL_ERROR);
+                abort_ = true;
+                co_return;
             }
 
             // promised stream id 必须是合法的下一个对端流标识符
@@ -1399,24 +1400,31 @@ namespace h2x {
                 co_return;
             }
 
-            // PUSH_PROMISE 携带的头部块会修改连接级 HPACK 动态表; 即使应用
-            // 不消费推送也必须解码, 否则后续 HEADERS 解码会失步
-            // (RFC 9113 §4.3/§6.6).
-            const auto& frag = ppf.get_header_block_fragment();
-            if (!frag.empty() &&
-                !decode_header_block(sid, frag.data(), frag.size(), nullptr)) {
-                co_await send_goaway(sid, http2_error_code::COMPRESSION_ERROR);
-                abort_ = true;
-                co_return;
-            }
-
-            // 创建预留流.
-            auto it = streams_.emplace(promised_id, stream_state_data{}).first;
-            it->second.stream_id = promised_id;
-            it->second.state = stream_state::reserved_remote;
-            it->second.is_remote_initiated = true;
+            // 收到 PUSH_PROMISE 即建立预留流 (RFC 9113 §5.1/§6.6).
+            auto pit = streams_.emplace(promised_id, stream_state_data{}).first;
+            pit->second.stream_id = promised_id;
+            pit->second.state = stream_state::reserved_remote;
+            pit->second.is_remote_initiated = true;
             if (promised_id > last_peer_stream_id_)
                 last_peer_stream_id_ = promised_id;
+
+            // PUSH_PROMISE 携带的头部块会修改连接级 HPACK 动态表; 即使应用
+            // 不消费推送也必须解码, 否则后续 HEADERS 解码会失步
+            // (RFC 9113 §4.3/§6.6). 未置 END_HEADERS 时先暂存, 等 CONTINUATION.
+            const auto& frag = ppf.get_header_block_fragment();
+            if (ppf.is_end_headers()) {
+                if (!decode_header_block(sid, frag.data(), frag.size(), &pit->second)) {
+                    co_await send_goaway(sid, http2_error_code::COMPRESSION_ERROR);
+                    abort_ = true;
+                    co_return;
+                }
+            } else {
+                header_block_sid_ = sid;
+                header_block_promised_id_ = promised_id;
+                sit->second.pending_header_block.insert(
+                    sit->second.pending_header_block.end(),
+                    frag.begin(), frag.end());
+            }
             co_return;
         }
 
@@ -1547,6 +1555,9 @@ namespace h2x {
 
             auto it = streams_.find(sid);
             if (it == streams_.end()) {
+                // 在途块所属流不应被中途回收; 若发生则清理状态, 避免连接卡死.
+                header_block_sid_ = 0;
+                header_block_promised_id_ = 0;
                 co_return;
             }
 
@@ -1557,6 +1568,9 @@ namespace h2x {
             size_t limit = settings_.max_header_list_size > 0
                 ? settings_.max_header_list_size
                 : (16 * 1024 * 1024);
+            // 合成的 HEADERS 帧头只能表示 24 位负载长度.
+            if (limit > 0xFFFFFF)
+                limit = 0xFFFFFF;
             if (sd.pending_header_block.size() + frag.size() > limit) {
                 co_await send_goaway(sid, http2_error_code::ENHANCE_YOUR_CALM);
                 abort_ = true;
@@ -1567,6 +1581,24 @@ namespace h2x {
                 frag.begin(), frag.end());
 
             if (cf.is_end_headers()) {
+                if (header_block_promised_id_ != 0) {
+                    // PUSH_PROMISE 的头部块: 解码后落到被承诺流, 不使用
+                    // HEADERS 的 refused/discard/END_STREAM 语义.
+                    auto pit = streams_.find(header_block_promised_id_);
+                    if (!decode_header_block(sid, sd.pending_header_block.data(),
+                            sd.pending_header_block.size(),
+                            pit != streams_.end() ? &pit->second : nullptr)) {
+                        co_await send_goaway(sid, http2_error_code::COMPRESSION_ERROR);
+                        abort_ = true;
+                        co_return;
+                    }
+                    sd.pending_header_block.clear();
+                    header_block_sid_ = 0;
+                    header_block_promised_id_ = 0;
+                    maybe_release_stream(sid);
+                    co_return;
+                }
+
                 // 最后一块到达 — 解析累积的完整头部块.
                 if (!decode_header_block(sid, sd.pending_header_block.data(),
                         sd.pending_header_block.size(), &sd)) {
@@ -1580,6 +1612,7 @@ namespace h2x {
                     sd.headers.clear();
                     sd.pending_header_block.clear();
                     header_block_sid_ = 0;
+                    header_block_promised_id_ = 0;
                     co_await send_rst_stream(sid, http2_error_code::REFUSED_STREAM);
                     streams_.erase(sid);
                     co_return;
@@ -1590,6 +1623,7 @@ namespace h2x {
                     sd.discard_headers = false;
                     sd.pending_header_block.clear();
                     header_block_sid_ = 0;
+                    header_block_promised_id_ = 0;
                     if (sd.state == stream_state::half_closed_remote) {
                         co_await send_rst_stream(sid, http2_error_code::STREAM_CLOSED);
                     }
@@ -1607,6 +1641,7 @@ namespace h2x {
 
                 sd.pending_header_block.clear();
                 header_block_sid_ = 0;
+                header_block_promised_id_ = 0;
 
                 // 尝试释放已终止且数据已消费完的流.
                 maybe_release_stream(sid);
