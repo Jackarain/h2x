@@ -724,7 +724,6 @@ namespace h2x {
             bool remote_end_stream = false;
             bool reset_received = false;
             bool pending_end_stream = false;  // 暂存分片 HEADERS 的 END_STREAM 标志.
-            bool headers_in_progress = false; // 分片 HEADERS (END_HEADERS 未置位) 是否在途.
             bool discard_headers = false;     // 已关闭流上的头部块: 解码后丢弃.
             bool refused = false;             // 超过并发上限; 仅用于解码 HPACK 后拒绝.
 
@@ -1215,7 +1214,6 @@ namespace h2x {
                 wake_waiter(accept_waiter_);
             } else {
                 // 头部块有后续 CONTINUATION 帧 — 暂存原始 payload.
-                sd.headers_in_progress = true;
                 header_block_sid_ = sid;
                 sd.pending_end_stream = hf.end_stream_;
                 if (headers_after_remote_end)
@@ -1591,7 +1589,6 @@ namespace h2x {
                 if (sd.refused) {
                     sd.headers.clear();
                     sd.pending_header_block.clear();
-                    sd.headers_in_progress = false;
                     header_block_sid_ = 0;
                     co_await send_rst_stream(sid, http2_error_code::REFUSED_STREAM);
                     streams_.erase(sid);
@@ -1602,7 +1599,6 @@ namespace h2x {
                 if (sd.discard_headers) {
                     sd.discard_headers = false;
                     sd.pending_header_block.clear();
-                    sd.headers_in_progress = false;
                     header_block_sid_ = 0;
                     if (sd.state == stream_state::half_closed_remote) {
                         co_await send_rst_stream(sid, http2_error_code::STREAM_CLOSED);
@@ -1620,7 +1616,6 @@ namespace h2x {
                 wake_waiter(accept_waiter_);
 
                 sd.pending_header_block.clear();
-                sd.headers_in_progress = false;
                 header_block_sid_ = 0;
 
                 // 尝试释放已终止且数据已消费完的流.
