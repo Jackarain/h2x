@@ -1215,6 +1215,7 @@ namespace h2x {
             } else {
                 // 头部块有后续 CONTINUATION 帧 — 暂存原始 payload.
                 header_block_sid_ = sid;
+                header_block_promised_id_ = 0;
                 sd.pending_end_stream = hf.end_stream_;
                 if (headers_after_remote_end)
                     sd.discard_headers = true;
@@ -1837,6 +1838,11 @@ namespace h2x {
         // 正在接收的头部块所属流 ID (0 表示当前无在途头部块).
         // HEADERS 未置 END_HEADERS 后, 只允许同流的 CONTINUATION 帧.
         uint32_t header_block_sid_ = 0;
+
+        // 在途头部块的来源: 0 表示 HEADERS, 非 0 表示 PUSH_PROMISE 且值为
+        // 被承诺流 ID. PUSH_PROMISE 的块内容属于被承诺流, 但 CONTINUATION
+        // 与 header_block_sid_ 一样使用关联流 ID (RFC 9113 §6.6/§6.10).
+        uint32_t header_block_promised_id_ = 0;
 
         // 对端已发起的最大流 ID, 用于判定 RST_STREAM 是否落在空闲流上
         // (RFC 9113 §6.4): 高于该值的对端流从未开启, 属空闲流.
