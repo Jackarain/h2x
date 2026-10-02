@@ -1537,13 +1537,6 @@ namespace h2x {
 
             auto& sd = it->second;
 
-            // 没有在途的 HEADERS (END_HEADERS 未置位) 就收到 CONTINUATION → 协议错误.
-            if (!sd.headers_in_progress) {
-                co_await send_goaway(sid, http2_error_code::PROTOCOL_ERROR);
-                abort_ = true;
-                co_return;
-            }
-
             // 累积本次 CONTINUATION 的头部块片段, 并设置大小上限防止内存耗尽.
             auto& frag = cf.get_header_block_fragment();
             size_t limit = settings_.max_header_list_size > 0
